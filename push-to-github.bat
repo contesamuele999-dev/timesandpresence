@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo.
-echo === Presenze Istruttori: pubblica su GitHub (main) ===
+echo === Times ^& Presence: pubblica su GitHub (main) ===
 echo.
 
 git rev-parse --is-inside-work-tree >nul 2>&1

@@ -1,4 +1,4 @@
-const CACHE = 'presenze-istruttori-v1';
+const CACHE = 'times-presence-v1';
 const ASSETS = [
   './',
   './index.html',
@@ -28,13 +28,12 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (url.origin !== location.origin) return; // lascia passare le chiamate a Supabase
 
+  // network-first: quando c'è connessione usa sempre la versione più recente
+  // (offline, o rete lenta, torna alla copia in cache così l'app resta usabile)
   e.respondWith(
-    caches.match(e.request).then(cached => {
-      const network = fetch(e.request).then(res => {
-        caches.open(CACHE).then(c => c.put(e.request, res.clone()));
-        return res;
-      }).catch(() => cached);
-      return cached || network;
-    })
+    fetch(e.request).then(res => {
+      caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+      return res;
+    }).catch(() => caches.match(e.request))
   );
 });

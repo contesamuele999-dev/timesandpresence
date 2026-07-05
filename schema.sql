@@ -1,5 +1,5 @@
 -- ============================================================
--- Presenze Istruttori — schema Supabase
+-- Times & Presence — schema Supabase
 -- Esegui tutto questo file in Supabase → SQL Editor → New query → Run
 -- (per installazioni già esistenti, usa invece i file migration_*.sql)
 -- ============================================================
@@ -23,6 +23,7 @@ create table if not exists profiles (
   name text not null,
   role text not null check (role in ('admin','instructor')) default 'instructor',
   color text default '#E86B00',
+  avatar_url text,
   created_at timestamptz default now(),
   unique (user_id, workspace_id)
 );
@@ -136,6 +137,7 @@ $$;
 create policy ws_select on workspaces for select using (is_member(id));
 create policy ws_insert on workspaces for insert with check (auth.uid() is not null);
 create policy ws_update on workspaces for update using (my_role_in(id) = 'admin');
+create policy ws_delete on workspaces for delete using (my_role_in(id) = 'admin');
 -- lettura pubblica minimale per validare un invite_code in fase di join (filtrata lato client)
 create policy ws_select_by_code on workspaces for select using (true);
 
@@ -241,3 +243,20 @@ create policy att_del_guest on attendance for delete using (
 grant select on guest_links, calendars, slots, extra_slots, attendance, workspaces, profiles to anon;
 grant insert, update, delete on attendance to anon;
 grant insert on extra_slots to anon;
+
+-- ============================================================
+-- STORAGE: foto profilo (solo account registrati)
+-- ============================================================
+insert into storage.buckets (id, name, public) values ('avatars','avatars', true)
+  on conflict (id) do nothing;
+
+create policy avatars_public_read on storage.objects for select using (bucket_id = 'avatars');
+create policy avatars_owner_write on storage.objects for insert to authenticated with check (
+  bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+);
+create policy avatars_owner_update on storage.objects for update to authenticated using (
+  bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+);
+create policy avatars_owner_delete on storage.objects for delete to authenticated using (
+  bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text
+);

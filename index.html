@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Presenze Istruttori</title>
+<title>Times & Presence</title>
 <link rel="icon" href="./icons/icon-192.png">
 <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
 <link rel="manifest" href="./manifest.webmanifest">
@@ -11,7 +11,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Presenze">
+<meta name="apple-mobile-web-app-title" content="Times&Presence">
 <style>
   :root{
     --brand:#E86B00;
@@ -48,8 +48,9 @@
   header.topbar .brand small{display:block;font-weight:500;font-size:12px;opacity:.75;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   header.topbar button.icon{background:none;border:none;color:#fff;font-size:22px;padding:6px}
-  .avatar{width:34px;height:34px;border-radius:50%;background:var(--brand);color:#fff;
+  .avatar{width:34px;height:34px;border-radius:50%;background:var(--brand);color:#fff;overflow:hidden;
     display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0}
+  .avatar img{width:100%;height:100%;object-fit:cover}
 
   main{flex:1;padding:16px;max-width:920px;margin:0 auto;width:100%;padding-bottom:96px}
 
@@ -181,15 +182,15 @@
 
   .mhead-person{display:flex;flex-direction:column;align-items:center;gap:4px}
   .mavatar{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-    color:#fff;font-weight:800;font-size:12px;flex-shrink:0}
+    color:#fff;font-weight:800;font-size:12px;flex-shrink:0;overflow:hidden}
+  .mavatar img{width:100%;height:100%;object-fit:cover}
   .mavatar.guest{border:2px dashed rgba(255,255,255,.7)}
   .mname{font-size:10.5px;font-weight:700;color:var(--muted);max-width:56px;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap}
 
-  .mchip{position:relative;display:inline-flex;width:34px;height:34px;border-radius:11px;
-    border:2px solid var(--line);background:#fff;transition:transform .12s ease,background .15s,border-color .15s}
-  .mchip.on{background:linear-gradient(150deg,var(--brand-light),var(--ok));border-color:transparent;
-    box-shadow:0 3px 10px -2px rgba(30,158,90,.45)}
+  .mchip{position:relative;display:inline-flex;width:34px;height:34px;border-radius:10px;
+    border:2px solid var(--line);background:#fff;transition:transform .1s ease,background .15s,border-color .15s}
+  .mchip.on{background:var(--ok);border-color:var(--ok)}
   .mchip.on::after{content:'';position:absolute;left:11px;top:15px;width:11px;height:6px;
     border-left:2.5px solid #fff;border-bottom:2.5px solid #fff;transform:rotate(-45deg)}
   .mchip:active{transform:scale(.9)}

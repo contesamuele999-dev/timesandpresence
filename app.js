@@ -1,5 +1,5 @@
 /* ============================================================
-   Presenze Istruttori — app.js
+   Times & Presence — app.js
    App single-tenant-per-workspace, generica (palestra/azienda/famiglia).
    Nessun framework: stato globale S + render() che ridisegna #app.
    ============================================================ */
@@ -264,8 +264,10 @@ async function createAdditionalWorkspace(name){
   const code = genCode(6);
   const {data:ws, error} = await sb.from('workspaces').insert({name, invite_code:code}).select().single();
   if(error){ toast('Errore creazione spazio.'); return; }
-  const {data:prof, error:e2} = await sb.from('profiles').insert({user_id:S.session.user.id, workspace_id:ws.id, name:S.profile.name, role:'admin'}).select().single();
+  const {error:e2} = await sb.from('profiles').insert({user_id:S.session.user.id, workspace_id:ws.id, name:S.profile.name, role:'admin'});
   if(e2){ toast('Errore creazione profilo.'); return; }
+  const {data:prof, error:e3} = await sb.from('profiles').select('*').eq('user_id', S.session.user.id).eq('workspace_id', ws.id).single();
+  if(e3){ toast('Errore lettura profilo.'); return; }
   S.myProfiles.push(prof);
   S.myWorkspaces.push({id:ws.id, name:ws.name});
   closeModal();
@@ -278,12 +280,36 @@ async function joinAdditionalWorkspace(code){
   if(e1 || !ws){ toast('Codice invito non valido.'); return; }
   const already = S.myProfiles.find(p=>p.workspace_id===ws.id);
   if(already){ closeModal(); await activateProfile(already, 'switch'); return; }
-  const {data:prof, error:e2} = await sb.from('profiles').insert({user_id:S.session.user.id, workspace_id:ws.id, name:S.profile.name, role:'instructor'}).select().single();
+  const {error:e2} = await sb.from('profiles').insert({user_id:S.session.user.id, workspace_id:ws.id, name:S.profile.name, role:'instructor'});
   if(e2){ toast('Errore.'); return; }
+  const {data:prof, error:e3} = await sb.from('profiles').select('*').eq('user_id', S.session.user.id).eq('workspace_id', ws.id).single();
+  if(e3){ toast('Errore lettura profilo.'); return; }
   S.myProfiles.push(prof);
   S.myWorkspaces.push({id:ws.id, name:ws.name});
   closeModal();
   await activateProfile(prof, 'joined');
+}
+
+async function uploadAvatar(file){
+  if(!file.type.startsWith('image/')){ toast('Scegli un\'immagine.'); return; }
+  if(file.size > 5*1024*1024){ toast('Immagine troppo grande (max 5MB).'); return; }
+  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+  const path = `${S.session.user.id}/avatar.${ext}`;
+  toast('Caricamento foto...');
+  const {error} = await sb.storage.from('avatars').upload(path, file, {upsert:true, cacheControl:'3600'});
+  if(error){ toast('Errore caricamento foto.'); return; }
+  const {data} = sb.storage.from('avatars').getPublicUrl(path);
+  const url = data.publicUrl + '?t=' + Date.now();
+  const {error:e2} = await sb.from('profiles').update({avatar_url:url}).eq('user_id', S.session.user.id);
+  if(e2){ toast('Errore salvataggio foto.'); return; }
+  S.profile.avatar_url = url;
+  S.myProfiles.forEach(p=>{ if(p.user_id===S.session.user.id) p.avatar_url = url; });
+  if(S.instructors.length){
+    const me = S.instructors.find(p=>p.id===S.profile.id);
+    if(me) me.avatar_url = url;
+  }
+  toast('Foto profilo aggiornata.');
+  render();
 }
 
 async function doChangeEmail(newEmail){
@@ -474,6 +500,43 @@ async function loadSlotsForEditor(calendarId){
 }
 
 /* ---------------- instructors / invite / guest links (admin) ---------------- */
+async function renameWorkspace(newName){
+  const {error} = await sb.from('workspaces').update({name:newName}).eq('id', S.workspace.id);
+  if(error){ toast('Errore rinomina spazio.'); return; }
+  S.workspace.name = newName;
+  const mw = S.myWorkspaces.find(w=>w.id===S.workspace.id);
+  if(mw) mw.name = newName;
+  toast('Spazio rinominato.');
+  render();
+}
+
+async function deleteWorkspace(){
+  const wsId = S.workspace.id;
+  const {error} = await sb.from('workspaces').delete().eq('id', wsId);
+  if(error){ toast('Errore eliminazione spazio.'); return; }
+  S.myProfiles = S.myProfiles.filter(p=>p.workspace_id!==wsId);
+  S.myWorkspaces = S.myWorkspaces.filter(w=>w.id!==wsId);
+  if(S.myProfiles.length){
+    await activateProfile(S.myProfiles[0], 'switch');
+  } else {
+    S.profile=null; S.workspace=null; S.view='no-workspace'; render();
+  }
+}
+
+async function createFirstWorkspaceAfterOrphan(personName, wsName){
+  if(!personName || !wsName){ toast('Inserisci nome e spazio.'); return; }
+  const code = genCode(6);
+  const {data:ws, error} = await sb.from('workspaces').insert({name:wsName, invite_code:code}).select().single();
+  if(error){ toast('Errore creazione spazio.'); return; }
+  const {error:e2} = await sb.from('profiles').insert({user_id:S.session.user.id, workspace_id:ws.id, name:personName, role:'admin'});
+  if(e2){ toast('Errore creazione profilo.'); return; }
+  const {data:prof, error:e3} = await sb.from('profiles').select('*').eq('user_id', S.session.user.id).eq('workspace_id', ws.id).single();
+  if(e3){ toast('Errore lettura profilo.'); return; }
+  S.myProfiles = [prof];
+  S.myWorkspaces = [{id:ws.id, name:ws.name}];
+  await activateProfile(prof, 'created');
+}
+
 async function regenerateInviteCode(){
   const code = genCode(6);
   const {error} = await sb.from('workspaces').update({invite_code:code}).eq('id', S.workspace.id);
@@ -517,7 +580,27 @@ function render(){
   if(S.view==='setup'){ APP.appendChild(renderSetup()); return; }
   if(S.view==='guestname'){ APP.appendChild(renderGuestName()); return; }
   if(S.view==='auth'){ APP.appendChild(renderAuth()); return; }
+  if(S.view==='no-workspace'){ APP.appendChild(renderNoWorkspace()); return; }
   if(S.view==='app'){ APP.appendChild(renderShell()); return; }
+}
+
+function renderNoWorkspace(){
+  const d = document.createElement('div');
+  d.className = 'authwrap';
+  d.innerHTML = `
+    <div class="authbox">
+      <div class="logo"><div class="mark">📋</div><h1>Nessuno spazio</h1><p>Crea un nuovo spazio per continuare a usare l'app.</p></div>
+      <div class="card">
+        <label class="field"><span>Il tuo nome</span><input type="text" id="nw_name2"></label>
+        <label class="field"><span>Nome dello spazio</span><input type="text" id="nw_ws2"></label>
+        <button class="btn block" id="nw_go2">Crea</button>
+        <button class="btn ghost block" id="nw_out2" style="margin-top:8px">Esci</button>
+      </div>
+    </div>`;
+  d.querySelector('#nw_go2').onclick = ()=> createFirstWorkspaceAfterOrphan(
+    d.querySelector('#nw_name2').value.trim(), d.querySelector('#nw_ws2').value.trim());
+  d.querySelector('#nw_out2').onclick = doLogout;
+  return d;
 }
 
 function renderSetup(){
@@ -525,7 +608,7 @@ function renderSetup(){
   d.className = 'authwrap';
   d.innerHTML = `
     <div class="authbox card">
-      <div class="logo"><div class="mark">📋</div><h1>Presenze Istruttori</h1></div>
+      <div class="logo"><div class="mark">📋</div><h1>Times & Presence</h1></div>
       <p>${S.setupMsg ? esc(S.setupMsg) : 'Per avviare l\'app, apri il file <b>config.js</b> e incolla URL e chiave anon del tuo progetto Supabase (vedi README.md per la guida passo passo).'}</p>
     </div>`;
   return d;
@@ -561,7 +644,7 @@ function renderAuth(){
   const tab = S.authTab;
   d.innerHTML = `
     <div class="authbox">
-      <div class="logo"><div class="mark">📋</div><h1>Presenze Istruttori</h1><p>Organizza le presenze, in un attimo.</p></div>
+      <div class="logo"><div class="mark">📋</div><h1>Times & Presence</h1><p>Organizza le presenze, in un attimo.</p></div>
       <div class="card">
         <div class="authtabs">
           <button data-t="login" class="${tab==='login'?'active':''}">Accedi</button>
@@ -613,8 +696,9 @@ function renderShell(){
   const top = document.createElement('header');
   top.className = 'topbar';
   const initials = (myName()||'?').trim().slice(0,1).toUpperCase();
+  const myAvatar = !isGuest() && S.profile && S.profile.avatar_url;
   top.innerHTML = `
-    <div class="avatar">${esc(initials)}</div>
+    <div class="avatar">${myAvatar ? `<img src="${esc(myAvatar)}" alt="">` : esc(initials)}</div>
     <div class="brand">${esc(S.workspace ? S.workspace.name : '')}${!isGuest() ? ' <span style="opacity:.6">▾</span>' : ''}
       <small>${isGuest() ? 'Accesso rapido · '+esc(S.guest.name) : esc(myName())+(isAdmin()?' · Admin':'')}</small>
     </div>`;
@@ -793,7 +877,7 @@ function renderDayMatrix(dt){
   if(items.length===0){ day.innerHTML += `<p class="hint" style="margin-bottom:12px">Nessuna lezione.</p>`; return day; }
 
   const people = (S.instructors.length ? S.instructors : [S.profile].filter(Boolean))
-    .map(p=>({key:'p_'+p.id, name:p.name, guestCol:false, match:a=>a.instructor_id===p.id}));
+    .map(p=>({key:'p_'+p.id, name:p.name, avatar:p.avatar_url, guestCol:false, match:a=>a.instructor_id===p.id}));
   const guestMap = new Map();
   S.attendance.forEach(a=>{ if(a.guest_token && !guestMap.has(a.guest_token)) guestMap.set(a.guest_token, a.guest_name||'Ospite'); });
   const guests = Array.from(guestMap, ([token,name])=>({key:'g_'+token, name, guestCol:true, match:a=>a.guest_token===token}));
@@ -802,7 +886,8 @@ function renderDayMatrix(dt){
   const wrapT = document.createElement('div'); wrapT.className='matrixwrap card';
   const colHead = c=>{
     const first = c.name.split(' ')[0] || '?';
-    return `<th><div class="mhead-person"><span class="mavatar${c.guestCol?' guest':''}" style="background:${colorFor(c.key)}">${esc(first.slice(0,1).toUpperCase())}</span><span class="mname">${esc(first)}</span></div></th>`;
+    const avatarInner = c.avatar ? `<img src="${esc(c.avatar)}" alt="">` : esc(first.slice(0,1).toUpperCase());
+    return `<th><div class="mhead-person"><span class="mavatar${c.guestCol?' guest':''}" style="background:${colorFor(c.key)}">${avatarInner}</span><span class="mname">${esc(first)}</span></div></th>`;
   };
   let html = `<table class="matrix"><thead><tr><th>Orario</th>${cols.map(colHead).join('')}</tr></thead><tbody>`;
   items.forEach(it=>{
@@ -872,6 +957,19 @@ function renderIstruttori(){
   const d = document.createElement('div');
   d.innerHTML = `<h1>Istruttori</h1>`;
 
+  const nameCard = document.createElement('div');
+  nameCard.className = 'card';
+  nameCard.innerHTML = `
+    <h3>Nome dello spazio</h3>
+    <label class="field"><input type="text" id="wsNameInput" value="${esc(S.workspace.name)}"></label>
+    <button class="btn secondary sm" id="wsNameSave">Salva nome</button>`;
+  nameCard.querySelector('#wsNameSave').onclick = ()=>{
+    const v = nameCard.querySelector('#wsNameInput').value.trim();
+    if(!v) return toast('Il nome non può essere vuoto.');
+    renameWorkspace(v);
+  };
+  d.appendChild(nameCard);
+
   const wsCard = document.createElement('div');
   wsCard.className = 'card';
   wsCard.innerHTML = `
@@ -892,7 +990,9 @@ function renderIstruttori(){
   S.instructors.forEach(p=>{
     const row = document.createElement('div');
     row.className = 'listrow';
-    row.innerHTML = `<div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.role==='admin'?'Amministratore':'Istruttore'}</div></div>
+    const av = p.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="">` : esc((p.name||'?').trim().slice(0,1).toUpperCase());
+    row.innerHTML = `<div class="avatar" style="width:36px;height:36px">${av}</div>
+      <div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.role==='admin'?'Amministratore':'Istruttore'}</div></div>
       ${(p.id!==S.profile.id && p.role!=='admin') ? `<button class="btn ghost sm" data-rm>Rimuovi</button>` : ''}`;
     const rm = row.querySelector('[data-rm]');
     if(rm) rm.onclick = ()=>{ if(confirm(`Rimuovere ${p.name} dallo spazio?`)) removeInstructor(p.id); };
@@ -922,6 +1022,19 @@ function renderIstruttori(){
     });
   }
   d.appendChild(guestCard);
+
+  const dangerCard = document.createElement('div');
+  dangerCard.className = 'card';
+  dangerCard.innerHTML = `
+    <h3 style="color:var(--danger)">Zona pericolosa</h3>
+    <p class="hint">Elimina definitivamente questo spazio: calendari, orari, presenze e accessi rapidi di tutti i membri andranno persi per sempre. Non si può annullare.</p>
+    <button class="btn danger block" id="delWs">Elimina spazio "${esc(S.workspace.name)}"</button>`;
+  dangerCard.querySelector('#delWs').onclick = ()=>{
+    const typed = prompt(`Per confermare, scrivi esattamente il nome dello spazio: "${S.workspace.name}"`);
+    if(typed === S.workspace.name) deleteWorkspace();
+    else if(typed !== null) toast('Nome non corrispondente, spazio non eliminato.');
+  };
+  d.appendChild(dangerCard);
   return d;
 }
 
@@ -940,9 +1053,17 @@ function renderProfilo(){
     return d;
   }
   const email = S.session && S.session.user ? S.session.user.email : '';
+  const avInner = S.profile.avatar_url ? `<img src="${esc(S.profile.avatar_url)}" alt="">` : esc((S.profile.name||'?').trim().slice(0,1).toUpperCase());
   d.innerHTML = `
     <h1>Profilo</h1>
     <div class="card">
+      <div class="row" style="margin-bottom:14px">
+        <div class="avatar" style="width:64px;height:64px;font-size:24px">${avInner}</div>
+        <div class="col" style="gap:6px">
+          <button class="btn secondary sm" id="p_avatar_go">Cambia foto</button>
+          <input type="file" id="p_avatar_file" accept="image/*" class="hidden">
+        </div>
+      </div>
       <p><b>${esc(S.profile.name)}</b></p>
       <p class="hint">${S.profile.role==='admin'?'Amministratore':'Istruttore'} · ${esc(S.workspace.name)}</p>
       <button class="btn danger block" id="out" style="margin-top:14px">Esci</button>
@@ -967,6 +1088,11 @@ function renderProfilo(){
     </div>`;
   d.querySelector('#out').onclick = doLogout;
   d.querySelector('#p_ws').onclick = ()=> openModal({type:'my-workspaces'});
+  d.querySelector('#p_avatar_go').onclick = ()=> d.querySelector('#p_avatar_file').click();
+  d.querySelector('#p_avatar_file').onchange = e=>{
+    const file = e.target.files[0];
+    if(file) uploadAvatar(file);
+  };
   d.querySelector('#p_email_go').onclick = ()=> doChangeEmail(d.querySelector('#p_email').value.trim());
   d.querySelector('#p_pass_go').onclick = ()=> doChangePassword(d.querySelector('#p_pass1').value, d.querySelector('#p_pass2').value);
   return d;
