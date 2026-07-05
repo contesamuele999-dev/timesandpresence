@@ -5,7 +5,8 @@ organizzati per settimana, con calendari salvabili per periodo (Estate, Inverno,
 "usa e getta" senza registrazione.
 
 Nessuna build: HTML/CSS/JS puri + [Supabase](https://supabase.com) (database + login). Funziona anche
-solo aprendo `index.html` con un piccolo server statico.
+solo aprendo `index.html` con un piccolo server statico. È anche una **PWA**: si può installare su
+telefono/computer come un'app vera (icona, schermo intero, apre da sola senza barra del browser).
 
 ## 1. Crea il progetto Supabase (gratis)
 
@@ -41,7 +42,31 @@ python -m http.server 8080
 Apri l'indirizzo mostrato (es. `http://localhost:8080`).
 
 Per hosting reale gratuito basta caricare la cartella su [Netlify](https://netlify.com) (drag&drop) o
-[Vercel](https://vercel.com) — nessuna build necessaria.
+[Vercel](https://vercel.com) — nessuna build necessaria. Oppure usa GitHub Pages, vedi sotto.
+
+## 4. Deploy su GitHub Pages
+
+La cartella è già un repository git locale (primo commit fatto). Per pubblicarla:
+
+1. Crea un repository **vuoto** su [github.com/new](https://github.com/new) (pubblico, senza
+   README/licenza — sono già presenti in locale).
+2. Collega il repository locale a quello remoto (una sola volta):
+   ```bash
+   git remote add origin https://github.com/TUO-UTENTE/TUO-REPO.git
+   git push -u origin main
+   ```
+3. Su GitHub: **Settings → Pages → Build and deployment → Source: Deploy from a branch**,
+   branch `main`, cartella `/ (root)` → Save.
+4. Dopo 1-2 minuti l'app è online su `https://TUO-UTENTE.github.io/TUO-REPO/`.
+
+Da quel momento in poi, per pubblicare ogni modifica basta lanciare **`push-to-github.bat`**
+(doppio click) nella cartella del progetto: aggiunge tutte le modifiche, crea un commit e fa il
+push su `main` in automatico. Se non hai modifiche da pubblicare te lo dice e non fa nulla.
+
+> Nota sicurezza: `config.js` contiene la chiave *anon* di Supabase e finisce nel repository
+> pubblico — è previsto e sicuro: quella chiave è già visibile a chiunque apra l'app nel browser
+> (Network tab), la vera protezione dei dati sono le regole RLS nel database, non la segretezza
+> della chiave.
 
 ## Migrazioni (se hai già eseguito schema.sql in passato)
 
