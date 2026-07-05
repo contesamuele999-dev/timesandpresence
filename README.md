@@ -1,0 +1,79 @@
+# Presenze Istruttori
+
+Web app semplice per gestire le presenze di istruttori (o dipendenti, o familiari) a lezioni/turni
+organizzati per settimana, con calendari salvabili per periodo (Estate, Inverno, Extra...) e accessi
+"usa e getta" senza registrazione.
+
+Nessuna build: HTML/CSS/JS puri + [Supabase](https://supabase.com) (database + login). Funziona anche
+solo aprendo `index.html` con un piccolo server statico.
+
+## 1. Crea il progetto Supabase (gratis)
+
+1. Vai su [supabase.com](https://supabase.com) → crea un account → **New project**.
+2. Una volta creato, vai su **SQL Editor** → **New query**, incolla tutto il contenuto di
+   [`schema.sql`](schema.sql) e premi **Run**. Crea tabelle e permessi.
+3. Vai su **Authentication → Providers → Email** e **disattiva "Confirm email"**.
+   Serve per far funzionare la registrazione al volo, senza dover controllare la posta: pensata
+   per chi non è pratico di tecnologia.
+4. Vai su **Project Settings → API**: copia **Project URL** e **anon public key**.
+
+## 2. Configura l'app
+
+Apri [`config.js`](config.js) e incolla i due valori:
+
+```js
+window.SUPABASE_URL = 'https://xxxxx.supabase.co';
+window.SUPABASE_ANON_KEY = 'eyJ...';
+```
+
+Salva. Fatto: l'app è pronta.
+
+## 3. Avvio
+
+Serve un piccolo server statico (per motivi di sicurezza il browser non apre `fetch` da `file://`):
+
+```bash
+npx serve .
+# oppure
+python -m http.server 8080
+```
+
+Apri l'indirizzo mostrato (es. `http://localhost:8080`).
+
+Per hosting reale gratuito basta caricare la cartella su [Netlify](https://netlify.com) (drag&drop) o
+[Vercel](https://vercel.com) — nessuna build necessaria.
+
+## Migrazioni (se hai già eseguito schema.sql in passato)
+
+Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
+
+1. [`migration_multi_workspace.sql`](migration_multi_workspace.sql) — **necessaria**: senza questa
+   l'accesso non funziona più (il codice ora richiede la colonna `user_id` su `profiles`). Abilita anche
+   un account a gestire più spazi e include già la fix precedente per la lettura pubblica dei profili.
+
+## Come funziona
+
+- **Crea spazio**: la prima persona registra il proprio "spazio" (palestra, azienda, famiglia...) e
+  diventa amministratore. Riceve un **codice invito** da condividere con gli altri (scheda Istruttori).
+- **Ho un codice**: chiunque altro si registra inserendo quel codice → entra come istruttore.
+- **Accesso rapido (usa e getta)**: l'amministratore genera un link temporaneo (1/3/7 giorni) dalla
+  scheda Istruttori. Chi apre il link inserisce solo il proprio nome e può subito segnare la presenza,
+  senza creare un account.
+- **Calendari**: l'amministratore crea calendari per periodo (Estate/Inverno/Extra/Personalizzato),
+  imposta gli orari settimanali ricorrenti, e sceglie quale calendario è "attivo" (quello mostrato di
+  default). Tutti i calendari restano salvati e selezionabili dal menu a tendina in Presenze.
+- **Presenze**: vista a settimana, un tocco per segnare "presente" su ogni lezione (swipe a
+  sinistra/destra da mobile per cambiare settimana). Si possono aggiungere lezioni extra one-off
+  (es. lezioni private) su una data specifica. Di default è mostrata la "Vista di tutti" (presenze di
+  ogni istruttore e ospite), con un pulsante per passare alla vista personale.
+- **Più spazi con lo stesso account**: tocca il nome dello spazio in alto (o "Cambia o aggiungi spazio"
+  nel Profilo) per vedere tutti gli spazi a cui appartieni, crearne uno nuovo, o entrare in un altro
+  spazio con un codice invito — utile per chi gestisce più palestre/aziende/famiglie con un solo login.
+
+## Limiti noti / da valutare in futuro
+
+- Rimuovere un istruttore toglie l'accesso allo spazio ma non cancella l'account Supabase sottostante.
+- Non c'è ancora un modo per segnare esplicitamente "assente" (l'assenza è semplicemente l'assenza di
+  spunta): sufficiente per l'uso previsto, ma facilmente estendibile in `app.js` (`toggleAttendance`).
+- La "Vista di tutti" per l'amministratore è di sola consultazione (non permette di segnare la presenza
+  al posto di un altro istruttore) — coerente con le policy di sicurezza (RLS) del database.
