@@ -1,6 +1,6 @@
 {
-  "name": "Times & Presence",
-  "short_name": "Times&Presence",
+  "name": "Presencer",
+  "short_name": "Presencer",
   "description": "Gestione presenze istruttori/dipendenti a lezioni e turni settimanali",
   "start_url": "./",
   "scope": "./",

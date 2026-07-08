@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Times & Presence</title>
+<title>Presencer</title>
 <link rel="icon" href="./icons/icon-192.png">
 <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
 <link rel="manifest" href="./manifest.webmanifest">
@@ -11,7 +11,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Times&Presence">
+<meta name="apple-mobile-web-app-title" content="Presencer">
 <style>
   :root{
     --brand:#E86B00;
@@ -161,6 +161,10 @@
   button.togglebtn{flex-shrink:0;border:1.5px solid var(--line);border-radius:12px;background:#fff;
     padding:10px 14px;font-weight:700;font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:center}
   button.togglebtn.on{background:var(--ok-bg);border-color:#BFE8D2;color:var(--ok)}
+  button.togglebtn.on.rec{background:#EAF6EF;border-color:#BFE8D2;border-style:dashed}
+  button.togglebtn.off{background:#FDECEA;border-color:#F3C6BD;color:var(--danger)}
+  button.recurbtn{flex-shrink:0;padding:8px 10px;font-size:16px;opacity:.5}
+  button.recurbtn.on{opacity:1;background:#FFF1E4;border-color:var(--brand)}
 
   .matrixwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .matrixwrap{position:relative}
@@ -193,6 +197,11 @@
   .mchip.on{background:var(--ok);border-color:var(--ok)}
   .mchip.on::after{content:'';position:absolute;left:11px;top:15px;width:11px;height:6px;
     border-left:2.5px solid #fff;border-bottom:2.5px solid #fff;transform:rotate(-45deg)}
+  .mchip.on.rec{background:repeating-linear-gradient(45deg,var(--ok),var(--ok) 4px,#8bd1ab 4px,#8bd1ab 8px)}
+  .mchip.off{background:var(--danger);border-color:var(--danger)}
+  .mchip.off::after,.mchip.off::before{content:'';position:absolute;top:15px;left:9px;width:16px;height:2.5px;background:#fff}
+  .mchip.off::after{transform:rotate(45deg)}
+  .mchip.off::before{transform:rotate(-45deg)}
   .mchip:active{transform:scale(.9)}
 
   @media (max-width:480px){

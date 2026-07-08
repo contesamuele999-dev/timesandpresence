@@ -1,5 +1,5 @@
 /* ============================================================
-   Times & Presence — app.js
+   Presencer — app.js
    App single-tenant-per-workspace, generica (palestra/azienda/famiglia).
    Nessun framework: stato globale S + render() che ridisegna #app.
    ============================================================ */
@@ -33,6 +33,7 @@ const S = {
   slots: [],
   extraSlots: [],
   attendance: [],
+  recurring: [],
   showAllMatrix: false,
 
   instructors: [],
@@ -158,11 +159,12 @@ async function activateProfile(prof, reason){
   S.selectedCalendarId = ws.active_calendar_id || null;
   S.weekOffset = 0;
   S.tab = 'presenze';
-  S.calendars = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.instructors = []; S.guestLinks = [];
+  S.calendars = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = []; S.guestLinks = [];
   localStorage.setItem('activeWs_'+S.session.user.id, prof.workspace_id);
   S.view='app';
   render();
   await loadCalendars();
+  await applyScheduledCalendarIfDue();
   if(!S.selectedCalendarId && S.calendars.length) S.selectedCalendarId = S.calendars[0].id;
   await loadInstructors();
   await refreshWeekData();
@@ -372,8 +374,16 @@ async function loadAttendanceForWeek(monday){
   S.attendance = rows;
 }
 
+async function loadRecurring(){
+  const slotIds = S.slots.map(s=>s.id);
+  if(!slotIds.length || isGuest()){ S.recurring = []; return; }
+  const {data} = await sb.from('recurring_presence').select('*').in('slot_id', slotIds);
+  S.recurring = data || [];
+}
+
 async function refreshWeekData(){
   await loadSlots();
+  await loadRecurring();
   const monday = mondayOf(S.weekOffset);
   await loadExtraForWeek(monday);
   await loadAttendanceForWeek(monday);
@@ -410,27 +420,86 @@ function findMyAttendance(ref, dateStr){
   });
 }
 
-async function toggleAttendance(ref, dateStr){
+function isRecurringFor(slotId, instructorId){
+  return S.recurring.some(r=>r.slot_id===slotId && r.instructor_id===instructorId);
+}
+function isMyRecurring(slotId){ return !isGuest() && isRecurringFor(slotId, myProfileId()); }
+
+// stato "effettivo" per me su uno slot/data: riga esplicita se c'è, altrimenti presenza
+// implicita se lo slot è marcato come ricorrente, altrimenti nessuno stato (non segnato).
+function myAttendanceState(ref, dateStr){
+  const row = findMyAttendance(ref, dateStr);
+  if(row) return row.status; // 'presente' | 'assente'
+  if(ref.slot_id && isMyRecurring(ref.slot_id)) return 'ricorrente';
+  return null;
+}
+
+async function setAttendanceStatus(ref, dateStr, status){
   const existing = findMyAttendance(ref, dateStr);
   if(existing){
-    S.attendance = S.attendance.filter(a=>a.id!==existing.id);
+    S.attendance = S.attendance.map(a=> a.id===existing.id ? Object.assign({}, a, {status}) : a);
     render();
-    const {error} = await sb.from('attendance').delete().eq('id', existing.id);
+    const {error} = await sb.from('attendance').update({status}).eq('id', existing.id);
     if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
   } else {
     const tempId = 'tmp_'+Math.random();
-    const payload = Object.assign({date:dateStr, status:'presente'}, ref,
+    const payload = Object.assign({date:dateStr, status}, ref,
       isGuest() ? {guest_token:S.guest.token, guest_name:S.guest.name} : {instructor_id:myProfileId()});
     S.attendance.push(Object.assign({id:tempId}, payload));
     render();
     const {data, error} = await sb.from('attendance').insert(payload).select().single();
     if(error){
       S.attendance = S.attendance.filter(a=>a.id!==tempId);
-      toast('Non è stato possibile segnare la presenza.');
+      toast('Errore, riprova.');
       render();
     } else {
       const idx = S.attendance.findIndex(a=>a.id===tempId);
       if(idx>=0) S.attendance[idx]=data;
+    }
+  }
+}
+
+async function clearAttendance(ref, dateStr){
+  const existing = findMyAttendance(ref, dateStr);
+  if(!existing) return;
+  S.attendance = S.attendance.filter(a=>a.id!==existing.id);
+  render();
+  const {error} = await sb.from('attendance').delete().eq('id', existing.id);
+  if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
+}
+
+// ciclo al tocco: senza ricorrenza → non segnato → presente → assente → non segnato.
+// con ricorrenza → presente (implicito) → assente (eccezione) → torna al ricorrente.
+async function cycleAttendance(ref, dateStr){
+  const state = myAttendanceState(ref, dateStr);
+  if(state===null) return setAttendanceStatus(ref, dateStr, 'presente');
+  if(state==='presente') return setAttendanceStatus(ref, dateStr, 'assente');
+  if(state==='assente') return clearAttendance(ref, dateStr);
+  if(state==='ricorrente') return setAttendanceStatus(ref, dateStr, 'assente');
+}
+
+async function toggleRecurring(slotId){
+  if(isGuest()) return;
+  const existing = S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===myProfileId());
+  if(existing){
+    S.recurring = S.recurring.filter(r=>r.id!==existing.id);
+    render();
+    const {error} = await sb.from('recurring_presence').delete().eq('id', existing.id);
+    if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
+    else toast('Presenza ricorrente disattivata.');
+  } else {
+    const tempId = 'tmp_'+Math.random();
+    S.recurring.push({id:tempId, slot_id:slotId, instructor_id:myProfileId()});
+    render();
+    const {data, error} = await sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId()}).select().single();
+    if(error){
+      S.recurring = S.recurring.filter(r=>r.id!==tempId);
+      toast('Errore, riprova.');
+      render();
+    } else {
+      const idx = S.recurring.findIndex(r=>r.id===tempId);
+      if(idx>=0) S.recurring[idx]=data;
+      toast('Presenza ricorrente attivata: segnato "presente" ogni settimana su questo orario.');
     }
   }
 }
@@ -466,6 +535,43 @@ async function setActiveCalendar(id){
   S.workspace.active_calendar_id = id;
   toast('Calendario impostato come attivo.');
   render();
+}
+
+async function scheduleCalendarChange(calendarId, date){
+  if(!calendarId || !date){ toast('Scegli calendario e data.'); return; }
+  const {error} = await sb.from('workspaces').update({scheduled_calendar_id:calendarId, scheduled_calendar_date:date}).eq('id', S.workspace.id);
+  if(error){ toast('Errore programmazione.'); return; }
+  S.workspace.scheduled_calendar_id = calendarId;
+  S.workspace.scheduled_calendar_date = date;
+  closeModal();
+  toast('Cambio calendario programmato.');
+  render();
+}
+
+async function cancelScheduledCalendarChange(){
+  const {error} = await sb.from('workspaces').update({scheduled_calendar_id:null, scheduled_calendar_date:null}).eq('id', S.workspace.id);
+  if(error){ toast('Errore.'); return; }
+  S.workspace.scheduled_calendar_id = null;
+  S.workspace.scheduled_calendar_date = null;
+  toast('Programmazione annullata.');
+  render();
+}
+
+// se una data programmata è arrivata (oggi o passata), attiva il calendario in coda.
+// controllato lato client all'apertura dell'app (non c'è un backend con cron).
+async function applyScheduledCalendarIfDue(){
+  const ws = S.workspace;
+  if(!ws || !ws.scheduled_calendar_id || !ws.scheduled_calendar_date) return;
+  if(ws.scheduled_calendar_date > todayISO()) return;
+  const targetId = ws.scheduled_calendar_id;
+  const {error} = await sb.from('workspaces').update({active_calendar_id:targetId, scheduled_calendar_id:null, scheduled_calendar_date:null}).eq('id', ws.id);
+  if(error) return;
+  ws.active_calendar_id = targetId;
+  ws.scheduled_calendar_id = null;
+  ws.scheduled_calendar_date = null;
+  S.selectedCalendarId = targetId;
+  const cal = S.calendars.find(c=>c.id===targetId);
+  toast(`Calendario cambiato automaticamente in "${cal ? cal.name : ''}".`);
 }
 
 async function deleteCalendar(id){
@@ -552,6 +658,13 @@ async function removeInstructor(id){
   await loadInstructors();
 }
 
+async function setInstructorRole(id, role){
+  const {error} = await sb.from('profiles').update({role}).eq('id', id);
+  if(error){ toast('Errore.'); return; }
+  toast(role==='admin' ? 'Ora è amministratore.' : 'Ora è istruttore.');
+  await loadInstructors();
+}
+
 async function createGuestLink(label, hours){
   const token = genToken();
   const expires = new Date(Date.now() + hours*3600*1000).toISOString();
@@ -608,7 +721,7 @@ function renderSetup(){
   d.className = 'authwrap';
   d.innerHTML = `
     <div class="authbox card">
-      <div class="logo"><div class="mark">📋</div><h1>Times & Presence</h1></div>
+      <div class="logo"><div class="mark">📋</div><h1>Presencer</h1></div>
       <p>${S.setupMsg ? esc(S.setupMsg) : 'Per avviare l\'app, apri il file <b>config.js</b> e incolla URL e chiave anon del tuo progetto Supabase (vedi README.md per la guida passo passo).'}</p>
     </div>`;
   return d;
@@ -644,7 +757,7 @@ function renderAuth(){
   const tab = S.authTab;
   d.innerHTML = `
     <div class="authbox">
-      <div class="logo"><div class="mark">📋</div><h1>Times & Presence</h1><p>Organizza le presenze, in un attimo.</p></div>
+      <div class="logo"><div class="mark">📋</div><h1>Presencer</h1><p>Organizza le presenze, in un attimo.</p></div>
       <div class="card">
         <div class="authtabs">
           <button data-t="login" class="${tab==='login'?'active':''}">Accedi</button>
@@ -850,16 +963,23 @@ function renderDayList(dt){
     return day;
   }
   items.forEach(it=>{
-    const mine = !!findMyAttendance(it.ref, dateStr);
+    const state = myAttendanceState(it.ref, dateStr);
+    const btnClass = state==='presente' ? 'on' : state==='assente' ? 'off' : state==='ricorrente' ? 'on rec' : '';
+    const btnLabel = state==='presente' ? '✅ Presente' : state==='assente' ? '❌ Assente' : state==='ricorrente' ? '✅ Presente 🔁' : 'Segna presenza';
+    const canRecur = !it.extra && !isGuest();
+    const recurOn = canRecur && isMyRecurring(it.id);
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
       <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}</div></div>
-      <button class="togglebtn ${mine?'on':''}">${mine?'✅ Presente':'Segna presenza'}</button>
+      ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Presente ogni settimana su questo orario">🔁</button>` : ''}
+      <button class="togglebtn ${btnClass}">${btnLabel}</button>
       ${it.extra && (isAdmin() || S.profile) ? `<button class="btn ghost sm" data-del="${it.id}">✕</button>` : ''}
     `;
-    row.querySelector('.togglebtn').onclick = ()=> toggleAttendance(it.ref, dateStr);
+    row.querySelector('.togglebtn').onclick = ()=> cycleAttendance(it.ref, dateStr);
+    const recurBtn = row.querySelector('.recurbtn');
+    if(recurBtn) recurBtn.onclick = ()=> toggleRecurring(it.id);
     const delBtn = row.querySelector('[data-del]');
     if(delBtn) delBtn.onclick = ()=>{ if(confirm('Eliminare questa lezione extra?')) deleteExtraSlot(it.id); };
     day.appendChild(row);
@@ -877,7 +997,7 @@ function renderDayMatrix(dt){
   if(items.length===0){ day.innerHTML += `<p class="hint" style="margin-bottom:12px">Nessuna lezione.</p>`; return day; }
 
   const people = (S.instructors.length ? S.instructors : [S.profile].filter(Boolean))
-    .map(p=>({key:'p_'+p.id, name:p.name, avatar:p.avatar_url, guestCol:false, match:a=>a.instructor_id===p.id}));
+    .map(p=>({key:'p_'+p.id, name:p.name, avatar:p.avatar_url, guestCol:false, instructorId:p.id, match:a=>a.instructor_id===p.id}));
   const guestMap = new Map();
   S.attendance.forEach(a=>{ if(a.guest_token && !guestMap.has(a.guest_token)) guestMap.set(a.guest_token, a.guest_name||'Ospite'); });
   const guests = Array.from(guestMap, ([token,name])=>({key:'g_'+token, name, guestCol:true, match:a=>a.guest_token===token}));
@@ -893,11 +1013,14 @@ function renderDayMatrix(dt){
   items.forEach(it=>{
     html += `<tr><td>${fmtHM(it.start)} ${esc(it.label)}</td>`;
     cols.forEach(c=>{
-      const on = S.attendance.some(a=>{
+      const row = S.attendance.find(a=>{
         const sameSlot = it.ref.slot_id ? a.slot_id===it.ref.slot_id : a.extra_slot_id===it.ref.extra_slot_id;
         return sameSlot && a.date===dateStr && c.match(a);
       });
-      html += `<td><span class="mchip ${on?'on':''}"></span></td>`;
+      let state = row ? row.status : null;
+      if(!state && !c.guestCol && !it.extra && isRecurringFor(it.id, c.instructorId)) state = 'ricorrente';
+      const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='assente' ? 'off' : '';
+      html += `<td><span class="mchip ${cls}"></span></td>`;
     });
     html += `</tr>`;
   });
@@ -926,6 +1049,19 @@ function renderCalendari(){
     d.appendChild(empty);
     return d;
   }
+  if(S.workspace.scheduled_calendar_id && S.workspace.scheduled_calendar_date){
+    const target = S.calendars.find(c=>c.id===S.workspace.scheduled_calendar_id);
+    const banner = document.createElement('div');
+    banner.className = 'card';
+    banner.style.background = '#FFF1E4';
+    banner.innerHTML = `
+      <div class="row between">
+        <div><b>Cambio programmato</b><div class="hint" style="margin-top:2px">Il calendario attivo passerà a <b>${esc(target?target.name:'')}</b> il ${new Date(S.workspace.scheduled_calendar_date).toLocaleDateString('it-IT')}.</div></div>
+        <button class="btn ghost sm" id="cancelSched">Annulla</button>
+      </div>`;
+    banner.querySelector('#cancelSched').onclick = ()=>{ if(confirm('Annullare il cambio calendario programmato?')) cancelScheduledCalendarChange(); };
+    d.appendChild(banner);
+  }
   S.calendars.forEach(c=>{
     const card = document.createElement('div');
     card.className = 'card';
@@ -936,11 +1072,15 @@ function renderCalendari(){
       </div>
       <div class="row" style="margin-top:10px">
         ${!active?`<button class="btn secondary sm" data-act="mkactive">Rendi attivo</button>`:''}
+        ${!active?`<button class="btn secondary sm" data-act="sched">Programma cambio</button>`:''}
         <button class="btn secondary sm" data-act="edit">Modifica orari</button>
         <button class="btn ghost sm" data-act="del">Elimina</button>
       </div>`;
     card.querySelector('[data-act="edit"]').onclick = ()=> openCalendarEditor(c);
-    if(!active) card.querySelector('[data-act="mkactive"]').onclick = ()=> setActiveCalendar(c.id);
+    if(!active){
+      card.querySelector('[data-act="mkactive"]').onclick = ()=> setActiveCalendar(c.id);
+      card.querySelector('[data-act="sched"]').onclick = ()=> openModal({type:'schedule-calendar', calendarId:c.id});
+    }
     card.querySelector('[data-act="del"]').onclick = ()=>{ if(confirm(`Eliminare "${c.name}" e tutti i suoi orari?`)) deleteCalendar(c.id); };
     d.appendChild(card);
   });
@@ -993,7 +1133,14 @@ function renderIstruttori(){
     const av = p.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="">` : esc((p.name||'?').trim().slice(0,1).toUpperCase());
     row.innerHTML = `<div class="avatar" style="width:36px;height:36px">${av}</div>
       <div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.role==='admin'?'Amministratore':'Istruttore'}</div></div>
+      ${p.id!==S.profile.id ? `<button class="btn ghost sm" data-role>${p.role==='admin'?'Rendi istruttore':'Rendi admin'}</button>` : ''}
       ${(p.id!==S.profile.id && p.role!=='admin') ? `<button class="btn ghost sm" data-rm>Rimuovi</button>` : ''}`;
+    const roleBtn = row.querySelector('[data-role]');
+    if(roleBtn) roleBtn.onclick = ()=>{
+      const next = p.role==='admin' ? 'instructor' : 'admin';
+      const msg = next==='admin' ? `Rendere ${p.name} amministratore? Potrà modificare calendari, orari e membri.` : `Togliere i permessi di amministratore a ${p.name}?`;
+      if(confirm(msg)) setInstructorRole(p.id, next);
+    };
     const rm = row.querySelector('[data-rm]');
     if(rm) rm.onclick = ()=>{ if(confirm(`Rimuovere ${p.name} dallo spazio?`)) removeInstructor(p.id); };
     listCard.appendChild(row);
@@ -1144,6 +1291,15 @@ function renderModal(){
       if(!name) return toast('Inserisci un nome.');
       createCalendar(name, box.querySelector('#m_period').value);
     };
+  }
+
+  else if(m.type==='schedule-calendar'){
+    box.innerHTML = `
+      <div class="mhead"><h2>Programma cambio calendario</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 12px">Alla data scelta, questo calendario diventerà automaticamente quello attivo (al primo accesso all'app di un membro dello spazio da quella data in poi).</p>
+      <label class="field"><span>Data del cambio</span><input type="date" id="s_date" value="${todayISO()}"></label>
+      <button class="btn block" id="s_save">Programma</button>`;
+    box.querySelector('#s_save').onclick = ()=> scheduleCalendarChange(m.calendarId, box.querySelector('#s_date').value);
   }
 
   else if(m.type==='edit-calendar'){

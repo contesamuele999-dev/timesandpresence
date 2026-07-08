@@ -1,4 +1,4 @@
-# Times & Presence
+# Presencer
 
 Web app semplice per gestire le presenze di istruttori (o dipendenti, o familiari) a lezioni/turni
 organizzati per settimana, con calendari salvabili per periodo (Estate, Inverno, Extra...) e accessi
@@ -75,6 +75,10 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 1. [`migration_multi_workspace.sql`](migration_multi_workspace.sql) — **necessaria**: senza questa
    l'accesso non funziona più (il codice ora richiede la colonna `user_id` su `profiles`). Abilita anche
    un account a gestire più spazi e include già la fix precedente per la lettura pubblica dei profili.
+2. [`migration_workspace_mgmt_avatar.sql`](migration_workspace_mgmt_avatar.sql) — rinomina/elimina spazi,
+   foto profilo.
+3. [`migration_scheduling_recurring.sql`](migration_scheduling_recurring.sql) — cambio calendario
+   programmato e presenza ricorrente (vedi sotto).
 
 ## Come funziona
 
@@ -94,11 +98,23 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - **Più spazi con lo stesso account**: tocca il nome dello spazio in alto (o "Cambia o aggiungi spazio"
   nel Profilo) per vedere tutti gli spazi a cui appartieni, crearne uno nuovo, o entrare in un altro
   spazio con un codice invito — utile per chi gestisce più palestre/aziende/famiglie con un solo login.
+- **Cambio calendario programmato**: dalla scheda Calendari, un amministratore può programmare che un
+  calendario diventi automaticamente attivo a una data futura ("Programma cambio"). Il controllo avviene
+  lato client al primo accesso all'app da parte di un membro dello spazio a partire da quella data (non
+  c'è un backend con cron, quindi non scatta se nessuno apre l'app quel giorno — scatterà al primo
+  accesso successivo).
+- **Più amministratori**: dalla scheda Istruttori, un admin può promuovere un istruttore ad amministratore
+  (o toglierlo) con il pulsante "Rendi admin" / "Rendi istruttore" sulla riga del membro.
+- **Presenza ricorrente**: nella vista Presenze, il pulsante 🔁 su un orario ricorrente segna quell'orario
+  come "presente ogni settimana" per te, senza doverlo spuntare manualmente. Puoi comunque segnare
+  un'eccezione (assente) su una singola data toccando il pulsante di presenza di quel giorno.
+- **Assenza esplicita**: il pulsante di presenza ora ha tre stati — non segnato, presente (✅), assente
+  (❌) — così si distingue chi non ha ancora segnato nulla da chi ha segnato di non esserci.
 
 ## Limiti noti / da valutare in futuro
 
 - Rimuovere un istruttore toglie l'accesso allo spazio ma non cancella l'account Supabase sottostante.
-- Non c'è ancora un modo per segnare esplicitamente "assente" (l'assenza è semplicemente l'assenza di
-  spunta): sufficiente per l'uso previsto, ma facilmente estendibile in `app.js` (`toggleAttendance`).
 - La "Vista di tutti" per l'amministratore è di sola consultazione (non permette di segnare la presenza
   al posto di un altro istruttore) — coerente con le policy di sicurezza (RLS) del database.
+- Il cambio calendario programmato non scatta se nessuno apre l'app nel giorno previsto: scatta al primo
+  accesso successivo di un membro registrato (non funziona per gli accessi ospite).

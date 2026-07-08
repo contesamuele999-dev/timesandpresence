@@ -12,6 +12,8 @@ create table if not exists workspaces (
   name text not null,
   invite_code text unique not null,
   active_calendar_id uuid,
+  scheduled_calendar_id uuid,
+  scheduled_calendar_date date,
   created_at timestamptz default now()
 );
 
@@ -39,6 +41,8 @@ create table if not exists calendars (
 
 alter table workspaces
   add constraint fk_active_calendar foreign key (active_calendar_id) references calendars(id) on delete set null;
+alter table workspaces
+  add constraint fk_scheduled_calendar foreign key (scheduled_calendar_id) references calendars(id) on delete set null;
 
 -- ---------- SLOTS (orari settimanali ricorrenti di un calendario) ----------
 create table if not exists slots (
@@ -104,6 +108,15 @@ create unique index if not exists attendance_unique_guest
   on attendance (slot_id, extra_slot_id, guest_token, date)
   where guest_token is not null;
 
+-- ---------- RECURRING PRESENCE (un istruttore segna un orario come "presente ogni settimana") ----------
+create table if not exists recurring_presence (
+  id uuid primary key default gen_random_uuid(),
+  slot_id uuid not null references slots(id) on delete cascade,
+  instructor_id uuid not null references profiles(id) on delete cascade,
+  created_at timestamptz default now(),
+  unique (slot_id, instructor_id)
+);
+
 -- ============================================================
 -- RLS
 -- ============================================================
@@ -114,6 +127,7 @@ alter table slots enable row level security;
 alter table extra_slots enable row level security;
 alter table guest_links enable row level security;
 alter table attendance enable row level security;
+alter table recurring_presence enable row level security;
 
 -- helper: l'utente loggato è membro dello spazio indicato?
 create or replace function is_member(ws uuid) returns boolean
@@ -237,6 +251,16 @@ create policy att_del_guest on attendance for delete using (
   guest_token is not null and exists (
     select 1 from guest_links g where g.token = attendance.guest_token and g.expires_at > now()
   )
+);
+
+-- recurring_presence: lettura per membri, scrittura solo per sé stessi (o admin in delete)
+create policy rp_select on recurring_presence for select using (
+  exists (select 1 from slots s join calendars c on c.id = s.calendar_id where s.id = recurring_presence.slot_id and is_member(c.workspace_id))
+);
+create policy rp_ins_self on recurring_presence for insert with check (is_my_profile(instructor_id));
+create policy rp_del_self on recurring_presence for delete using (
+  is_my_profile(instructor_id)
+  or exists (select 1 from slots s join calendars c on c.id = s.calendar_id where s.id = recurring_presence.slot_id and my_role_in(c.workspace_id) = 'admin')
 );
 
 -- consente anche al ruolo anon (non loggato) di leggere/scrivere le tabelle necessarie al flusso ospite
