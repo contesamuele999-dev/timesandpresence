@@ -113,6 +113,7 @@ create table if not exists recurring_presence (
   id uuid primary key default gen_random_uuid(),
   slot_id uuid not null references slots(id) on delete cascade,
   instructor_id uuid not null references profiles(id) on delete cascade,
+  status text not null default 'presente' check (status in ('presente','assente')),
   created_at timestamptz default now(),
   unique (slot_id, instructor_id)
 );

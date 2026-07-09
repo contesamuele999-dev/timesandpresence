@@ -34,3 +34,9 @@ create policy rp_del_self on recurring_presence for delete using (
 
 -- 3) l'assenza esplicita ("assente") esisteva già come valore di status ma non era
 --    mai usata dall'app: nessuna modifica di schema necessaria, solo lato client.
+
+-- 4) la presenza ricorrente ora replica lo stato impostato (presente/assente)
+--    invece di forzare sempre "presente". Colonna status con default retro-compatibile.
+alter table recurring_presence
+  add column if not exists status text not null default 'presente'
+  check (status in ('presente','assente'));

@@ -45,6 +45,7 @@ const S = {
 
 /* ---------------- PWA install + "ricordami" ---------------- */
 let deferredInstallPrompt = null;
+let installPopupShown = false;
 let rememberMe = localStorage.getItem('rememberMe') !== '0'; // default: sì, ricordami
 
 // storage per la sessione Supabase: se "ricordami" è attivo usa localStorage (persiste alla
@@ -84,10 +85,25 @@ function dismissInstall(){
   localStorage.setItem('installDismissed','1');
   render();
 }
+// popup automatico ai primi accessi (una sola volta per dispositivo)
+function maybeShowInstallPopup(){
+  if(installPopupShown) return;
+  if(S.view!=='app' || S.modal) return;
+  if(isStandalone()) return;
+  if(localStorage.getItem('installPopupSeen')==='1') return;
+  if(localStorage.getItem('installDismissed')==='1') return;
+  const im = installMode();
+  if(!im) return; // non installabile ora (né evento nativo né iOS Safari)
+  installPopupShown = true;
+  localStorage.setItem('installPopupSeen','1');
+  openModal({type:'install-prompt', mode: im});
+}
 window.addEventListener('beforeinstallprompt', (e)=>{
   e.preventDefault();
   deferredInstallPrompt = e;
   render();
+  // se l'evento arriva dopo che l'app è già aperta, proponi comunque il popup
+  setTimeout(maybeShowInstallPopup, 400);
 });
 window.addEventListener('appinstalled', ()=>{
   deferredInstallPrompt = null;
@@ -226,6 +242,7 @@ async function activateProfile(prof, reason){
   else if(reason==='switch') toast(`Passato a "${ws.name}".`);
   else if(reason==='created') toast(`Nuovo spazio "${ws.name}" creato.`);
   else if(reason==='joined') toast(`Sei entrato in "${ws.name}".`);
+  setTimeout(maybeShowInstallPopup, 1200);
 }
 
 /* ---------------- guest flow ---------------- */
@@ -261,6 +278,7 @@ async function enterGuestApp(){
   if(!S.selectedCalendarId && S.calendars.length) S.selectedCalendarId = S.calendars[0].id;
   await loadInstructors();
   await refreshWeekData();
+  setTimeout(maybeShowInstallPopup, 1200);
 }
 
 function guestLogout(){
@@ -478,6 +496,12 @@ function isRecurringFor(slotId, instructorId){
   return S.recurring.some(r=>r.slot_id===slotId && r.instructor_id===instructorId);
 }
 function isMyRecurring(slotId){ return !isGuest() && isRecurringFor(slotId, myProfileId()); }
+// stato replicato dalla ricorrenza ('presente' | 'assente'), o null se non ricorrente
+function recurringStatusFor(slotId, instructorId){
+  const r = S.recurring.find(x=>x.slot_id===slotId && x.instructor_id===instructorId);
+  return r ? (r.status || 'presente') : null;
+}
+function myRecurringStatus(slotId){ return isGuest() ? null : recurringStatusFor(slotId, myProfileId()); }
 
 // la presenza ricorrente vale solo dalla settimana corrente in poi: non deve "riempire"
 // retroattivamente le settimane passate (altrimenti sembra presente fisso ovunque).
@@ -488,7 +512,10 @@ function recurringAppliesOn(dateStr){ return dateStr >= toISO(mondayOf(0)); }
 function myAttendanceState(ref, dateStr){
   const row = findMyAttendance(ref, dateStr);
   if(row) return row.status; // 'presente' | 'assente'
-  if(ref.slot_id && isMyRecurring(ref.slot_id) && recurringAppliesOn(dateStr)) return 'ricorrente';
+  if(ref.slot_id && recurringAppliesOn(dateStr)){
+    const rs = myRecurringStatus(ref.slot_id);
+    if(rs) return rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
+  }
   return null;
 }
 
@@ -533,10 +560,11 @@ async function cycleAttendance(ref, dateStr){
   if(state===null) return setAttendanceStatus(ref, dateStr, 'presente');
   if(state==='presente') return setAttendanceStatus(ref, dateStr, 'assente');
   if(state==='assente') return clearAttendance(ref, dateStr);
-  if(state==='ricorrente') return setAttendanceStatus(ref, dateStr, 'assente');
+  if(state==='ricorrente') return setAttendanceStatus(ref, dateStr, 'assente');       // eccezione: assente questa settimana
+  if(state==='ricorrente-assente') return setAttendanceStatus(ref, dateStr, 'presente'); // eccezione: presente questa settimana
 }
 
-async function toggleRecurring(slotId){
+async function toggleRecurring(ref, slotId, dateStr){
   if(isGuest()) return;
   const existing = S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===myProfileId());
   if(existing){
@@ -546,10 +574,14 @@ async function toggleRecurring(slotId){
     if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
     else toast('Presenza ricorrente disattivata.');
   } else {
+    // replica lo stato attualmente impostato su questo orario (presente/assente),
+    // di default 'presente' se non ancora segnato.
+    const cur = findMyAttendance(ref, dateStr);
+    const status = cur ? cur.status : 'presente';
     const tempId = 'tmp_'+Math.random();
-    S.recurring.push({id:tempId, slot_id:slotId, instructor_id:myProfileId()});
+    S.recurring.push({id:tempId, slot_id:slotId, instructor_id:myProfileId(), status});
     render();
-    const {data, error} = await sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId()}).select().single();
+    const {data, error} = await sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId(), status}).select().single();
     if(error){
       S.recurring = S.recurring.filter(r=>r.id!==tempId);
       toast('Errore, riprova.');
@@ -557,7 +589,7 @@ async function toggleRecurring(slotId){
     } else {
       const idx = S.recurring.findIndex(r=>r.id===tempId);
       if(idx>=0) S.recurring[idx]=data;
-      toast('Presenza ricorrente attivata: segnato "presente" ogni settimana su questo orario.');
+      toast('Presenza ricorrente attivata: segnato "'+status+'" ogni settimana su questo orario.');
     }
   }
 }
@@ -1004,23 +1036,33 @@ function renderPresenze(){
 }
 
 function attachSwipeWeekNav(el){
-  let sx=null, sy=null, skip=false;
+  let sx=null, sy=null, scroller=null, startScroll=0, maxScroll=0;
   el.addEventListener('touchstart', e=>{
-    skip = !!e.target.closest('.matrixwrap');
-    if(skip) return;
     sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+    // se il tocco parte su una matrice scrollabile, ricordane lo scroll:
+    // lo swipe cambierà settimana solo quando la tabella è già al bordo.
+    scroller = e.target.closest('.matrixwrap');
+    if(scroller){
+      startScroll = scroller.scrollLeft;
+      maxScroll = scroller.scrollWidth - scroller.clientWidth;
+    } else { maxScroll = 0; }
   }, {passive:true});
   el.addEventListener('touchend', e=>{
-    if(skip || sx===null) return;
+    if(sx===null) return;
     const dx = e.changedTouches[0].clientX - sx;
     const dy = e.changedTouches[0].clientY - sy;
     sx = null;
-    if(Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)*1.5){
-      const forward = dx < 0;
-      S.weekOffset += forward ? 1 : -1;
-      S.navDir = forward ? 'next' : 'prev';
-      refreshWeekData();
+    if(!(Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)*1.5)) return;
+    const forward = dx < 0;
+    // se sto scorrendo dentro una tabella che può ancora scrollare in quella
+    // direzione, lascio scorrere la tabella e non cambio settimana.
+    if(scroller && maxScroll > 2){
+      if(forward && startScroll < maxScroll - 2) return;
+      if(!forward && startScroll > 2) return;
     }
+    S.weekOffset += forward ? 1 : -1;
+    S.navDir = forward ? 'next' : 'prev';
+    refreshWeekData();
   }, {passive:true});
 }
 
@@ -1045,8 +1087,8 @@ function renderDayList(dt){
   }
   items.forEach(it=>{
     const state = myAttendanceState(it.ref, dateStr);
-    const btnClass = state==='presente' ? 'on' : state==='assente' ? 'off' : state==='ricorrente' ? 'on rec' : '';
-    const btnLabel = state==='presente' ? '✅ Presente' : state==='assente' ? '❌ Assente' : state==='ricorrente' ? '✅ Presente 🔁' : 'Segna presenza';
+    const btnClass = state==='presente' ? 'on' : state==='assente' ? 'off' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : '';
+    const btnLabel = state==='presente' ? '✅ Presente' : state==='assente' ? '❌ Assente' : state==='ricorrente' ? '✅ Presente 🔁' : state==='ricorrente-assente' ? '❌ Assente 🔁' : 'Segna presenza';
     const canRecur = !it.extra && !isGuest();
     const recurOn = canRecur && isMyRecurring(it.id);
     const row = document.createElement('div');
@@ -1060,7 +1102,7 @@ function renderDayList(dt){
     `;
     row.querySelector('.togglebtn').onclick = ()=> cycleAttendance(it.ref, dateStr);
     const recurBtn = row.querySelector('.recurbtn');
-    if(recurBtn) recurBtn.onclick = ()=> toggleRecurring(it.id);
+    if(recurBtn) recurBtn.onclick = ()=> toggleRecurring(it.ref, it.id, dateStr);
     const delBtn = row.querySelector('[data-del]');
     if(delBtn) delBtn.onclick = ()=>{ if(confirm('Eliminare questa lezione extra?')) deleteExtraSlot(it.id); };
     day.appendChild(row);
@@ -1099,8 +1141,11 @@ function renderDayMatrix(dt){
         return sameSlot && a.date===dateStr && c.match(a);
       });
       let state = row ? row.status : null;
-      if(!state && !c.guestCol && !it.extra && isRecurringFor(it.id, c.instructorId) && recurringAppliesOn(dateStr)) state = 'ricorrente';
-      const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='assente' ? 'off' : '';
+      if(!state && !c.guestCol && !it.extra && recurringAppliesOn(dateStr)){
+        const rs = recurringStatusFor(it.id, c.instructorId);
+        if(rs) state = rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
+      }
+      const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : state==='assente' ? 'off' : '';
       html += `<td><span class="mchip ${cls}"></span></td>`;
     });
     html += `</tr>`;
@@ -1385,6 +1430,30 @@ function renderModal(){
       </ol>
       <button class="btn block" id="ios_ok" style="margin-top:8px">Ho capito</button>`;
     box.querySelector('#ios_ok').onclick = closeModal;
+  }
+
+  else if(m.type==='install-prompt'){
+    const ios = m.mode==='ios';
+    box.innerHTML = `
+      <div class="mhead"><h2>Installa l'app</h2><button id="x">✕</button></div>
+      <div style="text-align:center;margin:2px 0 14px">
+        <div style="font-size:46px;line-height:1">📲</div>
+        <p class="hint" style="margin:8px 4px 0">Aggiungi Presencer al telefono: si apre a schermo intero, parte più veloce e la usi come un'app vera.</p>
+      </div>
+      ${ios ? `
+        <ol style="margin:0 0 14px 18px;padding:0;line-height:1.8">
+          <li>Tocca <b>Condividi</b> ⬆️ nella barra di Safari.</li>
+          <li>Scegli <b>Aggiungi a schermata Home</b>.</li>
+          <li>Conferma con <b>Aggiungi</b>.</li>
+        </ol>
+        <button class="btn block" id="ip_ok">Ho capito</button>
+      ` : `
+        <button class="btn block" id="ip_go">Installa app</button>
+        <button class="btn ghost block" id="ip_later" style="margin-top:8px">Più tardi</button>
+      `}`;
+    const ok = box.querySelector('#ip_ok'); if(ok) ok.onclick = closeModal;
+    const go = box.querySelector('#ip_go'); if(go) go.onclick = ()=>{ closeModal(); doInstall(); };
+    const later = box.querySelector('#ip_later'); if(later) later.onclick = closeModal;
   }
 
   else if(m.type==='schedule-calendar'){
