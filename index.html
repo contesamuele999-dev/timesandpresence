@@ -237,6 +237,20 @@
   .segbtns button{border:1.5px solid var(--line);background:#fff;border-radius:10px;padding:8px 12px;
     font-size:13px;font-weight:700;color:var(--muted)}
   .segbtns button.on{background:var(--brand);border-color:var(--brand);color:#fff}
+
+  label.checkrow{display:flex;align-items:center;gap:10px;margin:2px 0 14px;font-size:14px;
+    color:var(--text);cursor:pointer}
+  label.checkrow input{width:18px;height:18px;accent-color:var(--brand);flex-shrink:0}
+
+  .installbar{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:60;
+    background:var(--dark);color:#fff;border-radius:14px;padding:10px 12px 10px 16px;display:flex;
+    align-items:center;gap:12px;box-shadow:0 8px 24px rgba(0,0,0,.28);max-width:92vw}
+  .installbar.above-tab{bottom:calc(74px + env(safe-area-inset-bottom))}
+  .installbar .txt{font-size:13px;font-weight:700;line-height:1.2}
+  .installbar .txt small{display:block;font-weight:500;opacity:.72;font-size:11px;margin-top:2px}
+  .installbar button.go{background:var(--brand);color:#fff;border:none;border-radius:10px;
+    padding:9px 13px;font-weight:700;font-size:13px;flex-shrink:0}
+  .installbar button.cl{background:none;border:none;color:#fff;opacity:.55;font-size:18px;padding:2px 4px;flex-shrink:0}
 </style>
 </head>
 <body>

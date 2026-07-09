@@ -1,4 +1,4 @@
-const CACHE = 'presencer-v2';
+const CACHE = 'presencer-v3';
 const ASSETS = [
   './',
   './index.html',

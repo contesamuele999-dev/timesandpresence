@@ -43,6 +43,58 @@ const S = {
   toast: '',
 };
 
+/* ---------------- PWA install + "ricordami" ---------------- */
+let deferredInstallPrompt = null;
+let rememberMe = localStorage.getItem('rememberMe') !== '0'; // default: sì, ricordami
+
+// storage per la sessione Supabase: se "ricordami" è attivo usa localStorage (persiste alla
+// chiusura del browser), altrimenti sessionStorage (sparisce a fine sessione). In lettura
+// controlla entrambi così il reload funziona in ogni caso.
+const authStorage = {
+  getItem: (k)=>{ const v = localStorage.getItem(k); return v!==null ? v : sessionStorage.getItem(k); },
+  setItem: (k,v)=>{
+    if(rememberMe){ localStorage.setItem(k,v); sessionStorage.removeItem(k); }
+    else { sessionStorage.setItem(k,v); localStorage.removeItem(k); }
+  },
+  removeItem: (k)=>{ localStorage.removeItem(k); sessionStorage.removeItem(k); },
+};
+
+function isStandalone(){
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+// 'prompt' = installabile via evento nativo (Android/Chrome/Edge); 'ios' = Safari iOS (istruzioni manuali); null = niente
+function installMode(){
+  if(isStandalone()) return null;
+  if(localStorage.getItem('installDismissed')==='1') return null;
+  if(deferredInstallPrompt) return 'prompt';
+  if(/iphone|ipad|ipod/i.test(navigator.userAgent) && /safari/i.test(navigator.userAgent)) return 'ios';
+  return null;
+}
+async function doInstall(){
+  if(deferredInstallPrompt){
+    deferredInstallPrompt.prompt();
+    try{ await deferredInstallPrompt.userChoice; }catch(e){}
+    deferredInstallPrompt = null;
+    render();
+  } else {
+    openModal({type:'ios-install'});
+  }
+}
+function dismissInstall(){
+  localStorage.setItem('installDismissed','1');
+  render();
+}
+window.addEventListener('beforeinstallprompt', (e)=>{
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  render();
+});
+window.addEventListener('appinstalled', ()=>{
+  deferredInstallPrompt = null;
+  localStorage.setItem('installDismissed','1');
+  render();
+});
+
 function toast(msg){
   S.toast = msg;
   render();
@@ -94,7 +146,9 @@ function boot(){
   if(!window.SUPABASE_URL || window.SUPABASE_URL.indexOf('INCOLLA_QUI') === 0){
     S.view='setup'; render(); return;
   }
-  sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+  sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
+    auth: { persistSession:true, autoRefreshToken:true, detectSessionInUrl:true, storage: authStorage }
+  });
 
   const params = new URLSearchParams(location.search);
   const g = params.get('g');
@@ -425,12 +479,16 @@ function isRecurringFor(slotId, instructorId){
 }
 function isMyRecurring(slotId){ return !isGuest() && isRecurringFor(slotId, myProfileId()); }
 
+// la presenza ricorrente vale solo dalla settimana corrente in poi: non deve "riempire"
+// retroattivamente le settimane passate (altrimenti sembra presente fisso ovunque).
+function recurringAppliesOn(dateStr){ return dateStr >= toISO(mondayOf(0)); }
+
 // stato "effettivo" per me su uno slot/data: riga esplicita se c'è, altrimenti presenza
-// implicita se lo slot è marcato come ricorrente, altrimenti nessuno stato (non segnato).
+// implicita se lo slot è marcato come ricorrente (da questa settimana in poi), altrimenti nessuno stato.
 function myAttendanceState(ref, dateStr){
   const row = findMyAttendance(ref, dateStr);
   if(row) return row.status; // 'presente' | 'assente'
-  if(ref.slot_id && isMyRecurring(ref.slot_id)) return 'ricorrente';
+  if(ref.slot_id && isMyRecurring(ref.slot_id) && recurringAppliesOn(dateStr)) return 'ricorrente';
   return null;
 }
 
@@ -775,8 +833,13 @@ function renderAuth(){
     form.innerHTML = `
       <label class="field"><span>Email</span><input type="email" id="a_email"></label>
       <label class="field"><span>Password</span><input type="password" id="a_pass"></label>
+      <label class="checkrow"><input type="checkbox" id="a_remember" ${rememberMe?'checked':''}><span>Ricordami su questo dispositivo</span></label>
       <button class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Accedi'}</button>`;
-    form.querySelector('#a_go').onclick = ()=> doLogin(form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
+    form.querySelector('#a_go').onclick = ()=>{
+      rememberMe = form.querySelector('#a_remember').checked;
+      localStorage.setItem('rememberMe', rememberMe?'1':'0');
+      doLogin(form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
+    };
   } else if(tab==='register'){
     form.innerHTML = `
       <label class="field"><span>Il tuo nome</span><input type="text" id="a_name"></label>
@@ -799,7 +862,22 @@ function renderAuth(){
       form.querySelector('#a_name').value.trim(), form.querySelector('#a_code').value.trim(),
       form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
   }
+  const im = installMode();
+  if(im) d.appendChild(renderInstallBar(im, false));
   return d;
+}
+
+function renderInstallBar(mode, aboveTab){
+  const bar = document.createElement('div');
+  bar.className = 'installbar' + (aboveTab ? ' above-tab' : '');
+  bar.innerHTML = `
+    <span style="font-size:22px">📲</span>
+    <div class="txt">Installa Presencer<small>${mode==='ios'?'Aggiungila alla schermata Home':'Aprila come app, a schermo intero'}</small></div>
+    <button class="go">Installa</button>
+    <button class="cl" title="Non ora">✕</button>`;
+  bar.querySelector('.go').onclick = doInstall;
+  bar.querySelector('.cl').onclick = dismissInstall;
+  return bar;
 }
 
 function renderShell(){
@@ -844,6 +922,9 @@ function renderShell(){
     render();
   });
   wrap.appendChild(nav);
+
+  const im = installMode();
+  if(im) wrap.appendChild(renderInstallBar(im, true));
 
   if(S.modal) wrap.appendChild(renderModal());
   if(S.toast){ const t=document.createElement('div'); t.className='toast'; t.textContent=S.toast; wrap.appendChild(t); }
@@ -1018,7 +1099,7 @@ function renderDayMatrix(dt){
         return sameSlot && a.date===dateStr && c.match(a);
       });
       let state = row ? row.status : null;
-      if(!state && !c.guestCol && !it.extra && isRecurringFor(it.id, c.instructorId)) state = 'ricorrente';
+      if(!state && !c.guestCol && !it.extra && isRecurringFor(it.id, c.instructorId) && recurringAppliesOn(dateStr)) state = 'ricorrente';
       const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='assente' ? 'off' : '';
       html += `<td><span class="mchip ${cls}"></span></td>`;
     });
@@ -1291,6 +1372,19 @@ function renderModal(){
       if(!name) return toast('Inserisci un nome.');
       createCalendar(name, box.querySelector('#m_period').value);
     };
+  }
+
+  else if(m.type==='ios-install'){
+    box.innerHTML = `
+      <div class="mhead"><h2>Installa su iPhone/iPad</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 12px">Per aggiungere Presencer alla schermata Home:</p>
+      <ol style="margin:0 0 8px 18px;padding:0;line-height:1.8">
+        <li>Tocca il pulsante <b>Condividi</b> ⬆️ nella barra di Safari.</li>
+        <li>Scorri e tocca <b>Aggiungi a schermata Home</b>.</li>
+        <li>Conferma con <b>Aggiungi</b> in alto a destra.</li>
+      </ol>
+      <button class="btn block" id="ios_ok" style="margin-top:8px">Ho capito</button>`;
+    box.querySelector('#ios_ok').onclick = closeModal;
   }
 
   else if(m.type==='schedule-calendar'){

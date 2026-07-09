@@ -109,7 +109,14 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
   come "presente ogni settimana" per te, senza doverlo spuntare manualmente. Puoi comunque segnare
   un'eccezione (assente) su una singola data toccando il pulsante di presenza di quel giorno.
 - **Assenza esplicita**: il pulsante di presenza ora ha tre stati — non segnato, presente (✅), assente
-  (❌) — così si distingue chi non ha ancora segnato nulla da chi ha segnato di non esserci.
+  (❌) — così si distingue chi non ha ancora segnato nulla da chi ha segnato di non esserci. La presenza
+  ricorrente vale solo dalla settimana corrente in poi (non riempie retroattivamente le settimane passate).
+- **Installa come app (PWA)**: quando il browser lo permette (Android/Chrome/Edge) compare in basso un
+  pulsante "Installa"; su iPhone/iPad (Safari) il pulsante mostra le istruzioni per "Aggiungi a schermata
+  Home". Il pulsante si può chiudere con ✕ e non ricompare più su quel dispositivo.
+- **Ricordami**: nella schermata di accesso c'è la spunta "Ricordami su questo dispositivo" (attiva di
+  default). Se disattivata, la sessione resta solo finché il browser è aperto (sessionStorage) e non
+  persiste alla chiusura.
 
 ## Limiti noti / da valutare in futuro
 
