@@ -63,12 +63,21 @@ const authStorage = {
 function isStandalone(){
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
-// 'prompt' = installabile via evento nativo (Android/Chrome/Edge); 'ios' = Safari iOS (istruzioni manuali); null = niente
+// 'prompt' = prompt nativo disponibile (beforeinstallprompt già arrivato);
+// 'android' = Android/Chromium senza prompt nativo (istruzioni manuali dal menu ⋮);
+// 'ios' = Safari iOS (istruzioni manuali); null = niente da mostrare
 function installMode(){
   if(isStandalone()) return null;
   if(localStorage.getItem('installDismissed')==='1') return null;
   if(deferredInstallPrompt) return 'prompt';
-  if(/iphone|ipad|ipod/i.test(navigator.userAgent) && /safari/i.test(navigator.userAgent)) return 'ios';
+  const ua = navigator.userAgent || '';
+  // iOS: Safari (o browser che usano WebKit) → istruzioni "Aggiungi a Home"
+  if(/iphone|ipad|ipod/i.test(ua)) return 'ios';
+  // Android su browser Chromium: il prompt nativo può tardare (engagement),
+  // non essere ancora "controllato" dal service worker al primo caricamento, o
+  // essere soppresso da Chrome per ~90 giorni dopo un rifiuto. In tutti questi
+  // casi offriamo comunque un percorso manuale invece di non mostrare nulla.
+  if(/android/i.test(ua) && /chrome|crios|edg|samsungbrowser/i.test(ua)) return 'android';
   return null;
 }
 async function doInstall(){
@@ -77,6 +86,8 @@ async function doInstall(){
     try{ await deferredInstallPrompt.userChoice; }catch(e){}
     deferredInstallPrompt = null;
     render();
+  } else if(/android/i.test(navigator.userAgent||'')){
+    openModal({type:'android-install'});
   } else {
     openModal({type:'ios-install'});
   }
@@ -110,6 +121,28 @@ window.addEventListener('appinstalled', ()=>{
   localStorage.setItem('installDismissed','1');
   render();
 });
+// Diagnostica: apri la console del browser e digita pwaDebug() per capire
+// perché il popup non compare (prompt nativo arrivato? SW attivo? flag salvati?).
+// resetInstall() cancella i flag così il popup può ricomparire.
+window.pwaDebug = function(){
+  const d = {
+    standalone: isStandalone(),
+    beforeinstallpromptRicevuto: !!deferredInstallPrompt,
+    installMode: installMode(),
+    swController: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+    installPopupSeen: localStorage.getItem('installPopupSeen'),
+    installDismissed: localStorage.getItem('installDismissed'),
+    userAgent: navigator.userAgent,
+  };
+  console.table(d);
+  return d;
+};
+window.resetInstall = function(){
+  localStorage.removeItem('installPopupSeen');
+  localStorage.removeItem('installDismissed');
+  installPopupShown = false;
+  console.log('Flag install azzerati. Ricarica la pagina.');
+};
 
 function toast(msg){
   S.toast = msg;
@@ -904,7 +937,7 @@ function renderInstallBar(mode, aboveTab){
   bar.className = 'installbar' + (aboveTab ? ' above-tab' : '');
   bar.innerHTML = `
     <span style="font-size:22px">📲</span>
-    <div class="txt">Installa Presencer<small>${mode==='ios'?'Aggiungila alla schermata Home':'Aprila come app, a schermo intero'}</small></div>
+    <div class="txt">Installa Presencer<small>${(mode==='ios'||mode==='android')?'Aggiungila alla schermata Home':'Aprila come app, a schermo intero'}</small></div>
     <button class="go">Installa</button>
     <button class="cl" title="Non ora">✕</button>`;
   bar.querySelector('.go').onclick = doInstall;
@@ -1434,6 +1467,7 @@ function renderModal(){
 
   else if(m.type==='install-prompt'){
     const ios = m.mode==='ios';
+    const androidManual = m.mode==='android';
     box.innerHTML = `
       <div class="mhead"><h2>Installa l'app</h2><button id="x">✕</button></div>
       <div style="text-align:center;margin:2px 0 14px">
@@ -1447,6 +1481,13 @@ function renderModal(){
           <li>Conferma con <b>Aggiungi</b>.</li>
         </ol>
         <button class="btn block" id="ip_ok">Ho capito</button>
+      ` : androidManual ? `
+        <ol style="margin:0 0 14px 18px;padding:0;line-height:1.8">
+          <li>Tocca il menu <b>⋮</b> in alto a destra in Chrome.</li>
+          <li>Scegli <b>Installa app</b> (o <b>Aggiungi a schermata Home</b>).</li>
+          <li>Conferma con <b>Installa</b>.</li>
+        </ol>
+        <button class="btn block" id="ip_ok">Ho capito</button>
       ` : `
         <button class="btn block" id="ip_go">Installa app</button>
         <button class="btn ghost block" id="ip_later" style="margin-top:8px">Più tardi</button>
@@ -1454,6 +1495,19 @@ function renderModal(){
     const ok = box.querySelector('#ip_ok'); if(ok) ok.onclick = closeModal;
     const go = box.querySelector('#ip_go'); if(go) go.onclick = ()=>{ closeModal(); doInstall(); };
     const later = box.querySelector('#ip_later'); if(later) later.onclick = closeModal;
+  }
+
+  else if(m.type==='android-install'){
+    box.innerHTML = `
+      <div class="mhead"><h2>Installa su Android</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 12px">Per aggiungere Presencer alla schermata Home:</p>
+      <ol style="margin:0 0 8px 18px;padding:0;line-height:1.8">
+        <li>Tocca il menu <b>⋮</b> in alto a destra in Chrome.</li>
+        <li>Scegli <b>Installa app</b> (o <b>Aggiungi a schermata Home</b>).</li>
+        <li>Conferma con <b>Installa</b>.</li>
+      </ol>
+      <button class="btn block" id="and_ok" style="margin-top:8px">Ho capito</button>`;
+    box.querySelector('#and_ok').onclick = closeModal;
   }
 
   else if(m.type==='schedule-calendar'){
