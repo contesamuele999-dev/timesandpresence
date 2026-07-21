@@ -1243,9 +1243,13 @@ function renderDayMatrix(dt){
     const avatarInner = c.avatar ? `<img src="${esc(c.avatar)}" alt="">` : esc(first.slice(0,1).toUpperCase());
     return `<th><div class="mhead-person"><span class="mavatar${c.guestCol?' guest':''}" style="background:${colorFor(c.key)}">${avatarInner}</span><span class="mname">${esc(first)}</span></div></th>`;
   };
+  const canLog = !isGuest();
   let html = `<table class="matrix"><thead><tr><th>Orario</th>${cols.map(colHead).join('')}</tr></thead><tbody>`;
-  items.forEach(it=>{
-    html += `<tr><td>${fmtHM(it.start)} ${esc(it.label)}</td>`;
+  items.forEach((it,idx)=>{
+    const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
+    const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
+    const logBtn = canLog ? `<button class="mlogbtn ${iHaveLog?'on':''}" data-li="${idx}" title="Registro lezione">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : '';
+    html += `<tr><td><div class="mlesson">${fmtHM(it.start)} ${esc(it.label)}${logBtn}</div></td>`;
     cols.forEach(c=>{
       const row = S.attendance.find(a=>{
         const sameSlot = it.ref.slot_id ? a.slot_id===it.ref.slot_id : a.extra_slot_id===it.ref.extra_slot_id;
@@ -1263,6 +1267,14 @@ function renderDayMatrix(dt){
   });
   html += `</tbody></table>`;
   wrapT.innerHTML = html;
+  if(canLog){
+    wrapT.querySelectorAll('.mlogbtn').forEach(b=> b.onclick = async ()=>{
+      const it = items[+b.dataset.li];
+      if(!it) return;
+      if(S.instructors.length===0) await loadInstructors();
+      openModal({type:'lesson-log', ref:it.ref, date:dateStr, label:it.label, start:it.start, end:it.end});
+    });
+  }
   if(cols.length>3){
     const hint = document.createElement('div');
     hint.className = 'matrixhint';

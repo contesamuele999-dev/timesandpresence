@@ -169,8 +169,15 @@
   button.recurbtn.on{opacity:1;background:#FFF1E4;border-color:var(--brand)}
   button.logbtn{flex-shrink:0;position:relative;padding:8px 10px;font-size:16px;opacity:.5}
   button.logbtn.on{opacity:1;background:#FFF1E4;border-color:var(--brand)}
-  button.logbtn .logbadge{position:absolute;top:-2px;right:-2px;min-width:16px;height:16px;padding:0 4px;
-    background:var(--brand);color:#fff;border-radius:9px;font-size:10px;font-weight:800;line-height:16px;text-align:center}
+  button.logbtn .logbadge{position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;padding:0 4px;
+    background:var(--brand);color:#fff;border-radius:9px;font-size:10px;font-weight:800;line-height:16px;
+    text-align:center;box-shadow:0 0 0 2px #fff}
+  /* pulsante "Oggi": distinto dagli altri (accento brand) */
+  button#wkToday{background:#FFF1E4;border-color:var(--brand);color:var(--brand);font-weight:800}
+  .mlesson{display:flex;align-items:center;gap:6px}
+  button.mlogbtn{position:relative;flex-shrink:0;border:1px solid var(--line);border-radius:9px;background:#fff;
+    padding:3px 6px;font-size:13px;line-height:1;opacity:.6}
+  button.mlogbtn.on{opacity:1;background:#FFF1E4;border-color:var(--brand)}
   .logentry{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#FBFAF8}
   .logentry .logwho{font-size:12px;font-weight:700;color:var(--brand);margin-bottom:3px}
   .logentry .logtext{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
@@ -220,6 +227,11 @@
     .mchip{width:30px;height:30px;border-radius:9px}
     .mchip.on::after{left:9px;top:13px;width:10px;height:5px}
     table.matrix td:first-child,table.matrix th:first-child{min-width:96px;font-size:12px}
+    /* riga lezione più compatta: evita che i pulsanti si sovrappongano al testo */
+    .slot{gap:6px;padding:10px}
+    .slot .time{width:52px;font-size:12px}
+    button.togglebtn{padding:8px 9px;font-size:12px}
+    button.recurbtn,button.logbtn{padding:7px 8px;font-size:15px}
   }
 
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,15,.45);z-index:50;display:flex;
