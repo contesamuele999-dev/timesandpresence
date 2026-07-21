@@ -875,8 +875,21 @@ async function revokeGuestLink(id){
 }
 
 /* ---------------- modal helpers ---------------- */
-function openModal(m){ S.modal = m; render(); }
-function closeModal(){ S.modal = null; render(); }
+let savedScrollY = 0;
+function lockScroll(){
+  if(document.body.classList.contains('modal-open')) return; // già bloccato
+  savedScrollY = window.scrollY || window.pageYOffset || 0;
+  document.body.style.top = `-${savedScrollY}px`;
+  document.body.classList.add('modal-open');
+}
+function unlockScroll(){
+  if(!document.body.classList.contains('modal-open')) return;
+  document.body.classList.remove('modal-open');
+  document.body.style.top = '';
+  window.scrollTo(0, savedScrollY);
+}
+function openModal(m){ S.modal = m; lockScroll(); render(); }
+function closeModal(){ S.modal = null; unlockScroll(); render(); }
 
 /* ================= RENDER ================= */
 function render(){
@@ -1338,6 +1351,7 @@ function renderCalendari(){
 
 async function openCalendarEditor(cal){
   S.modal = {type:'edit-calendar', calendar:cal, editSlots:[]};
+  lockScroll();
   await loadSlotsForEditor(cal.id);
 }
 
