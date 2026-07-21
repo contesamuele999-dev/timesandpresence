@@ -79,6 +79,8 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
    foto profilo.
 3. [`migration_scheduling_recurring.sql`](migration_scheduling_recurring.sql) — cambio calendario
    programmato e presenza ricorrente (vedi sotto).
+4. [`migration_lesson_log.sql`](migration_lesson_log.sql) — registro lezione: gli istruttori possono
+   scrivere cosa hanno fatto in ogni lezione (vedi sotto).
 
 ## Come funziona
 
@@ -111,6 +113,11 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - **Assenza esplicita**: il pulsante di presenza ora ha tre stati — non segnato, presente (✅), assente
   (❌) — così si distingue chi non ha ancora segnato nulla da chi ha segnato di non esserci. La presenza
   ricorrente vale solo dalla settimana corrente in poi (non riempie retroattivamente le settimane passate).
+- **Registro lezione**: nella vista Presenze (personale), ogni lezione ha il pulsante 📝 per scrivere
+  cosa è stato fatto in quella lezione in quella data (esercizi, argomenti, note). Ogni istruttore ha la
+  propria voce; tutti i membri dello spazio possono leggere le voci di tutti, ma ognuno modifica solo le
+  proprie (l'admin può eliminare qualsiasi voce). Un pallino con il numero sul 📝 indica quante voci ci
+  sono già per quella lezione.
 - **Installa come app (PWA)**: quando il browser lo permette (Android/Chrome/Edge) compare in basso un
   pulsante "Installa"; su iPhone/iPad (Safari) il pulsante mostra le istruzioni per "Aggiungi a schermata
   Home". Il pulsante si può chiudere con ✕ e non ricompare più su quel dispositivo.

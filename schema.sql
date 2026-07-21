@@ -118,6 +118,26 @@ create table if not exists recurring_presence (
   unique (slot_id, instructor_id)
 );
 
+-- ---------- LESSON LOGS (registro lezione: cosa ha fatto l'istruttore in una lezione) ----------
+create table if not exists lesson_logs (
+  id uuid primary key default gen_random_uuid(),
+  slot_id uuid references slots(id) on delete cascade,
+  extra_slot_id uuid references extra_slots(id) on delete cascade,
+  instructor_id uuid not null references profiles(id) on delete cascade,
+  date date not null,
+  content text not null,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  constraint ll_one_slot_ref check (
+    (slot_id is not null and extra_slot_id is null) or
+    (slot_id is null and extra_slot_id is not null)
+  )
+);
+create unique index if not exists lesson_logs_unique_slot
+  on lesson_logs (slot_id, instructor_id, date) where slot_id is not null;
+create unique index if not exists lesson_logs_unique_extra
+  on lesson_logs (extra_slot_id, instructor_id, date) where extra_slot_id is not null;
+
 -- ============================================================
 -- RLS
 -- ============================================================
@@ -129,6 +149,7 @@ alter table extra_slots enable row level security;
 alter table guest_links enable row level security;
 alter table attendance enable row level security;
 alter table recurring_presence enable row level security;
+alter table lesson_logs enable row level security;
 
 -- helper: l'utente loggato è membro dello spazio indicato?
 create or replace function is_member(ws uuid) returns boolean
@@ -262,6 +283,23 @@ create policy rp_ins_self on recurring_presence for insert with check (is_my_pro
 create policy rp_del_self on recurring_presence for delete using (
   is_my_profile(instructor_id)
   or exists (select 1 from slots s join calendars c on c.id = s.calendar_id where s.id = recurring_presence.slot_id and my_role_in(c.workspace_id) = 'admin')
+);
+
+-- lesson_logs: lettura per qualunque membro dello spazio; scrittura solo delle proprie voci (delete anche admin)
+create policy ll_select on lesson_logs for select using (
+  exists (select 1 from slots s join calendars c on c.id = s.calendar_id
+          where s.id = lesson_logs.slot_id and is_member(c.workspace_id))
+  or exists (select 1 from extra_slots e join calendars c on c.id = e.calendar_id
+             where e.id = lesson_logs.extra_slot_id and is_member(c.workspace_id))
+);
+create policy ll_ins_self on lesson_logs for insert with check (is_my_profile(instructor_id));
+create policy ll_upd_self on lesson_logs for update using (is_my_profile(instructor_id));
+create policy ll_del_self on lesson_logs for delete using (
+  is_my_profile(instructor_id)
+  or exists (select 1 from slots s join calendars c on c.id = s.calendar_id
+             where s.id = lesson_logs.slot_id and my_role_in(c.workspace_id) = 'admin')
+  or exists (select 1 from extra_slots e join calendars c on c.id = e.calendar_id
+             where e.id = lesson_logs.extra_slot_id and my_role_in(c.workspace_id) = 'admin')
 );
 
 -- consente anche al ruolo anon (non loggato) di leggere/scrivere le tabelle necessarie al flusso ospite

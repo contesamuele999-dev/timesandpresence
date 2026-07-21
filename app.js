@@ -34,6 +34,7 @@ const S = {
   extraSlots: [],
   attendance: [],
   recurring: [],
+  lessonLogs: [],       // registro lezione: cosa è stato fatto in ogni lezione/data
   showAllMatrix: false,
 
   instructors: [],
@@ -486,12 +487,31 @@ async function loadRecurring(){
   S.recurring = data || [];
 }
 
+async function loadLessonLogsForWeek(monday){
+  if(isGuest()){ S.lessonLogs = []; return; }
+  const dates = weekDates(monday);
+  const from = toISO(dates[0]), to = toISO(dates[6]);
+  const slotIds = S.slots.map(s=>s.id);
+  const extraIds = S.extraSlots.map(s=>s.id);
+  let rows = [];
+  if(slotIds.length){
+    const {data} = await sb.from('lesson_logs').select('*').in('slot_id', slotIds).gte('date', from).lte('date', to);
+    rows = rows.concat(data||[]);
+  }
+  if(extraIds.length){
+    const {data} = await sb.from('lesson_logs').select('*').in('extra_slot_id', extraIds).gte('date', from).lte('date', to);
+    rows = rows.concat(data||[]);
+  }
+  S.lessonLogs = rows;
+}
+
 async function refreshWeekData(){
   await loadSlots();
   await loadRecurring();
   const monday = mondayOf(S.weekOffset);
   await loadExtraForWeek(monday);
   await loadAttendanceForWeek(monday);
+  await loadLessonLogsForWeek(monday);
   render();
 }
 
@@ -550,6 +570,55 @@ function myAttendanceState(ref, dateStr){
     if(rs) return rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
   }
   return null;
+}
+
+/* ---------------- registro lezione (lesson logs) ---------------- */
+function logsFor(ref, dateStr){
+  return S.lessonLogs.filter(l=>{
+    const sameSlot = ref.slot_id ? l.slot_id===ref.slot_id : l.extra_slot_id===ref.extra_slot_id;
+    return sameSlot && l.date===dateStr;
+  }).sort((a,b)=> String(a.created_at).localeCompare(String(b.created_at)));
+}
+function myLessonLog(ref, dateStr){
+  if(isGuest()) return null;
+  return logsFor(ref, dateStr).find(l=> l.instructor_id===myProfileId()) || null;
+}
+function instructorName(id){
+  if(S.profile && S.profile.id===id) return S.profile.name;
+  const p = S.instructors.find(x=>x.id===id);
+  return p ? p.name : 'Istruttore';
+}
+
+async function saveLessonLog(ref, dateStr, content){
+  content = (content||'').trim();
+  const existing = myLessonLog(ref, dateStr);
+  if(!content){
+    if(existing) await deleteLessonLog(existing.id);
+    else closeModal();
+    return;
+  }
+  if(existing){
+    const {data, error} = await sb.from('lesson_logs')
+      .update({content, updated_at:new Date().toISOString()}).eq('id', existing.id).select().single();
+    if(error){ toast('Errore, riprova.'); return; }
+    S.lessonLogs = S.lessonLogs.map(l=> l.id===existing.id ? data : l);
+    toast('Registro salvato.');
+  } else {
+    const payload = Object.assign({date:dateStr, content, instructor_id:myProfileId()}, ref);
+    const {data, error} = await sb.from('lesson_logs').insert(payload).select().single();
+    if(error){ toast('Errore, riprova.'); return; }
+    S.lessonLogs.push(data);
+    toast('Registro salvato.');
+  }
+  closeModal();
+}
+
+async function deleteLessonLog(logId){
+  const {error} = await sb.from('lesson_logs').delete().eq('id', logId);
+  if(error){ toast('Errore, riprova.'); return; }
+  S.lessonLogs = S.lessonLogs.filter(l=> l.id!==logId);
+  toast('Voce eliminata.');
+  closeModal();
 }
 
 async function setAttendanceStatus(ref, dateStr, status){
@@ -1124,16 +1193,25 @@ function renderDayList(dt){
     const btnLabel = state==='presente' ? '✅ Presente' : state==='assente' ? '❌ Assente' : state==='ricorrente' ? '✅ Presente 🔁' : state==='ricorrente-assente' ? '❌ Assente 🔁' : 'Segna presenza';
     const canRecur = !it.extra && !isGuest();
     const recurOn = canRecur && isMyRecurring(it.id);
+    const canLog = !isGuest();
+    const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
+    const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
       <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}</div></div>
+      ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
       ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Presente ogni settimana su questo orario">🔁</button>` : ''}
       <button class="togglebtn ${btnClass}">${btnLabel}</button>
       ${it.extra && (isAdmin() || S.profile) ? `<button class="btn ghost sm" data-del="${it.id}">✕</button>` : ''}
     `;
     row.querySelector('.togglebtn').onclick = ()=> cycleAttendance(it.ref, dateStr);
+    const logBtn = row.querySelector('.logbtn');
+    if(logBtn) logBtn.onclick = async ()=>{
+      if(S.instructors.length===0) await loadInstructors(); // per mostrare i nomi degli autori
+      openModal({type:'lesson-log', ref:it.ref, date:dateStr, label:it.label, start:it.start, end:it.end});
+    };
     const recurBtn = row.querySelector('.recurbtn');
     if(recurBtn) recurBtn.onclick = ()=> toggleRecurring(it.ref, it.id, dateStr);
     const delBtn = row.querySelector('[data-del]');
@@ -1618,6 +1696,30 @@ function renderModal(){
       <label class="field"><span>Codice invito</span><input type="text" id="jw_code" style="text-transform:uppercase"></label>
       <button class="btn block" id="jw_go">Entra</button>`;
     box.querySelector('#jw_go').onclick = ()=> joinAdditionalWorkspace(box.querySelector('#jw_code').value.trim());
+  }
+
+  else if(m.type==='lesson-log'){
+    const dt = new Date(m.date+'T00:00:00');
+    const dateLabel = `${WEEKDAYS[(dt.getDay()+6)%7]} ${dt.getDate()} ${MONTHS[dt.getMonth()]} ${dt.getFullYear()}`;
+    const all = logsFor(m.ref, m.date);
+    const others = all.filter(l=> l.instructor_id!==myProfileId());
+    const mine = myLessonLog(m.ref, m.date);
+    const othersHtml = others.length ? `
+      <div class="col" style="gap:10px;margin-bottom:14px">
+        ${others.map(l=>`<div class="logentry"><div class="logwho">${esc(instructorName(l.instructor_id))}</div><div class="logtext">${esc(l.content)}</div></div>`).join('')}
+      </div>` : '';
+    box.innerHTML = `
+      <div class="mhead"><h2>Registro lezione</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 12px"><b>${esc(m.label)}</b> · ${esc(fmtHM(m.start))}–${esc(fmtHM(m.end))} · ${dateLabel}</p>
+      ${others.length ? `<h3 style="margin:0 0 6px">Altre voci</h3>${othersHtml}` : ''}
+      <label class="field"><span>${mine?'La tua voce':'Aggiungi la tua voce'}</span>
+        <textarea id="ll_text" rows="5" placeholder="Cosa avete fatto in questa lezione? (esercizi, argomenti, note...)">${mine?esc(mine.content):''}</textarea>
+      </label>
+      <button class="btn block" id="ll_save">${mine?'Salva modifiche':'Salva'}</button>
+      ${mine?`<button class="btn ghost block" id="ll_del" style="margin-top:8px">Elimina la mia voce</button>`:''}`;
+    box.querySelector('#ll_save').onclick = ()=> saveLessonLog(m.ref, m.date, box.querySelector('#ll_text').value);
+    const del = box.querySelector('#ll_del');
+    if(del) del.onclick = ()=>{ if(confirm('Eliminare la tua voce del registro?')) deleteLessonLog(mine.id); };
   }
 
   box.querySelector('#x').onclick = closeModal;
