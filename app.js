@@ -81,17 +81,54 @@ function installMode(){
   if(/android/i.test(ua) && /chrome|crios|edg|samsungbrowser/i.test(ua)) return 'android';
   return null;
 }
-async function doInstall(){
-  if(deferredInstallPrompt){
-    deferredInstallPrompt.prompt();
-    try{ await deferredInstallPrompt.userChoice; }catch(e){}
-    deferredInstallPrompt = null;
-    render();
-  } else if(/android/i.test(navigator.userAgent||'')){
-    openModal({type:'android-install'});
-  } else {
-    openModal({type:'ios-install'});
+// Lancia il prompt nativo. Ritorna true se il prompt è stato mostrato.
+async function firePrompt(){
+  if(!deferredInstallPrompt) return false;
+  const p = deferredInstallPrompt;
+  deferredInstallPrompt = null;
+  try{
+    p.prompt();
+    await p.userChoice;
+  }catch(e){
+    return false;
   }
+  render();
+  return true;
+}
+
+async function doInstall(){
+  // 1) prompt nativo già disponibile → installazione immediata
+  if(await firePrompt()) return;
+
+  // 2) iOS: nessuna API di installazione, servono le istruzioni manuali
+  if(/iphone|ipad|ipod/i.test(navigator.userAgent||'')){
+    openModal({type:'ios-install'});
+    return;
+  }
+
+  // 3) Android/desktop Chromium: il beforeinstallprompt può arrivare con qualche
+  // istante di ritardo (service worker non ancora controller, engagement, ecc.).
+  // Aspettiamo brevemente e, se arriva, partiamo diretti senza mostrare istruzioni.
+  const got = await waitForPrompt(2500);
+  if(got && await firePrompt()) return;
+
+  // 4) davvero non installabile via API → fallback istruzioni
+  openModal({type:'android-install'});
+}
+
+// Attende l'evento beforeinstallprompt fino a ms millisecondi.
+function waitForPrompt(ms){
+  if(deferredInstallPrompt) return Promise.resolve(true);
+  return new Promise(resolve=>{
+    let done = false;
+    const on = ()=>{ if(done) return; done = true; cleanup(); resolve(true); };
+    const cleanup = ()=>{
+      window.removeEventListener('beforeinstallprompt', on);
+      clearTimeout(timer);
+    };
+    const timer = setTimeout(()=>{ if(done) return; done = true; cleanup(); resolve(!!deferredInstallPrompt); }, ms);
+    window.addEventListener('beforeinstallprompt', on);
+  });
 }
 function dismissInstall(){
   localStorage.setItem('installDismissed','1');
@@ -1020,9 +1057,14 @@ function renderInstallBar(mode, aboveTab){
   bar.innerHTML = `
     <span style="font-size:22px">📲</span>
     <div class="txt">Installa Presencer<small>${(mode==='ios'||mode==='android')?'Aggiungila alla schermata Home':'Aprila come app, a schermo intero'}</small></div>
-    <button class="go">Installa</button>
+    <button class="go">${mode==='ios'?'Come fare':'Installa'}</button>
     <button class="cl" title="Non ora">✕</button>`;
-  bar.querySelector('.go').onclick = doInstall;
+  const go = bar.querySelector('.go');
+  go.onclick = async ()=>{
+    if(mode!=='ios'){ go.disabled = true; go.textContent = 'Attendi...'; }
+    try{ await doInstall(); }
+    finally{ go.disabled = false; go.textContent = mode==='ios'?'Come fare':'Installa'; }
+  };
   bar.querySelector('.cl').onclick = dismissInstall;
   return bar;
 }
