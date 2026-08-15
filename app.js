@@ -27,7 +27,9 @@ const S = {
 
   tab: 'presenze',      // presenze | calendari | istruttori | profilo
   calendars: [],
-  selectedCalendarId: null,
+  calendarPeriods: [],  // [{id, workspace_id, calendar_id, start_date}]
+  selectedCalendarId: null, // ID del calendario effettivo per la data visualizzata
+  selectedCalendarOverrideId: null, // manual override se l'utente sceglie un calendario specifico nel menu
   weekOffset: 0,
   navDir: null,          // 'next' | 'prev' | null — direzione per l'animazione di cambio settimana
   slots: [],
@@ -226,7 +228,42 @@ function fmtRange(monday){
   return `${monday.getDate()} ${MONTHS[monday.getMonth()]} – ${sun.getDate()} ${MONTHS[sun.getMonth()]}`;
 }
 function todayISO(){ return toISO(new Date()); }
+function nextMondayISO(){
+  const d = new Date();
+  const day = (d.getDay() + 6) % 7; // 0=lun, 6=dom
+  const daysUntilNextMon = 7 - day;
+  const nextMon = new Date(d.getFullYear(), d.getMonth(), d.getDate() + (daysUntilNextMon === 0 ? 7 : daysUntilNextMon));
+  return toISO(nextMon);
+}
 function fmtHM(t){ return t ? t.slice(0,5) : ''; }
+
+/* Determina quale calendario è attivo per una data specifica in base alla cronologia periodi */
+function calendarForDate(dateStr){
+  if(S.calendarPeriods && S.calendarPeriods.length){
+    const valid = S.calendarPeriods
+      .filter(p => p.start_date <= dateStr)
+      .sort((a, b) => b.start_date.localeCompare(a.start_date));
+    if(valid.length) return valid[0].calendar_id;
+    // Se la data è antecedente a tutti i periodi, usa il primo periodo disponibile
+    const sorted = [...S.calendarPeriods].sort((a, b) => a.start_date.localeCompare(b.start_date));
+    if(sorted.length) return sorted[0].calendar_id;
+  }
+  // Fallback se la tabella calendar_periods non è ancora popolata
+  const ws = S.workspace;
+  if(ws && ws.scheduled_calendar_id && ws.scheduled_calendar_date){
+    if(dateStr >= ws.scheduled_calendar_date) return ws.scheduled_calendar_id;
+    if(ws.active_calendar_id) return ws.active_calendar_id;
+  }
+  if(ws && ws.active_calendar_id) return ws.active_calendar_id;
+  return S.calendars.length ? S.calendars[0].id : null;
+}
+
+/* Restituisce l'ID del calendario per una settimana (a partire dal lunedì) */
+function getEffectiveCalendarForWeek(monday){
+  if(S.selectedCalendarOverrideId) return S.selectedCalendarOverrideId;
+  const mondayStr = toISO(monday);
+  return calendarForDate(mondayStr) || (S.calendars.length ? S.calendars[0].id : null);
+}
 
 /* ---------------- boot ---------------- */
 function boot(){
@@ -297,16 +334,15 @@ async function activateProfile(prof, reason){
   const {data:ws, error} = await sb.from('workspaces').select('*').eq('id', prof.workspace_id).maybeSingle();
   if(error){ toast('Errore caricamento spazio.'); return; }
   S.workspace = ws;
-  S.selectedCalendarId = ws.active_calendar_id || null;
   S.weekOffset = 0;
+  S.selectedCalendarOverrideId = null;
   S.tab = 'presenze';
-  S.calendars = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = []; S.guestLinks = [];
+  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = []; S.guestLinks = [];
   localStorage.setItem('activeWs_'+S.session.user.id, prof.workspace_id);
   S.view='app';
   render();
   await loadCalendars();
   await applyScheduledCalendarIfDue();
-  if(!S.selectedCalendarId && S.calendars.length) S.selectedCalendarId = S.calendars[0].id;
   await loadInstructors();
   await refreshWeekData();
   if(reason==='login' && S.myProfiles.length>1) toast(`Sei in "${ws.name}" — tocca il nome in alto per cambiare spazio.`);
@@ -342,11 +378,12 @@ function submitGuestName(name){
 async function enterGuestApp(){
   const {data:ws} = await sb.from('workspaces').select('*').eq('id', S.guest.workspace_id).maybeSingle();
   S.workspace = ws;
-  S.selectedCalendarId = ws ? ws.active_calendar_id : null;
+  S.weekOffset = 0;
+  S.selectedCalendarOverrideId = null;
   S.view='app'; S.tab='presenze';
+  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = [];
   render();
   await loadCalendars();
-  if(!S.selectedCalendarId && S.calendars.length) S.selectedCalendarId = S.calendars[0].id;
   await loadInstructors();
   await refreshWeekData();
   setTimeout(maybeShowInstallPopup, 1200);
@@ -479,24 +516,41 @@ async function doLogout(){
 }
 
 /* ---------------- data loaders ---------------- */
+async function loadCalendarPeriods(){
+  if(!S.workspace){ S.calendarPeriods = []; return; }
+  try {
+    const {data, error} = await sb.from('calendar_periods').select('*').eq('workspace_id', S.workspace.id).order('start_date', {ascending:true});
+    if(!error && data){
+      S.calendarPeriods = data;
+    } else {
+      S.calendarPeriods = [];
+    }
+  } catch(e){
+    S.calendarPeriods = [];
+  }
+}
+
 async function loadCalendars(){
   const wsId = S.workspace.id;
   const {data} = await sb.from('calendars').select('*').eq('workspace_id', wsId).order('created_at');
   S.calendars = data || [];
+  await loadCalendarPeriods();
   render();
 }
 
 async function loadSlots(){
-  if(!S.selectedCalendarId){ S.slots=[]; return; }
-  const {data} = await sb.from('slots').select('*').eq('calendar_id', S.selectedCalendarId).order('weekday').order('start_time');
+  const calIds = S.calendars.map(c=>c.id);
+  if(!calIds.length){ S.slots=[]; return; }
+  const {data} = await sb.from('slots').select('*').in('calendar_id', calIds).order('weekday').order('start_time');
   S.slots = data || [];
 }
 
 async function loadExtraForWeek(monday){
-  if(!S.selectedCalendarId){ S.extraSlots=[]; return; }
+  const calIds = S.calendars.map(c=>c.id);
+  if(!calIds.length){ S.extraSlots=[]; return; }
   const dates = weekDates(monday);
   const from = toISO(dates[0]), to = toISO(dates[6]);
-  const {data} = await sb.from('extra_slots').select('*').eq('calendar_id', S.selectedCalendarId).gte('date', from).lte('date', to).order('date').order('start_time');
+  const {data} = await sb.from('extra_slots').select('*').in('calendar_id', calIds).gte('date', from).lte('date', to).order('date').order('start_time');
   S.extraSlots = data || [];
 }
 
@@ -543,9 +597,10 @@ async function loadLessonLogsForWeek(monday){
 }
 
 async function refreshWeekData(){
+  const monday = mondayOf(S.weekOffset);
+  S.selectedCalendarId = getEffectiveCalendarForWeek(monday);
   await loadSlots();
   await loadRecurring();
-  const monday = mondayOf(S.weekOffset);
   await loadExtraForWeek(monday);
   await loadAttendanceForWeek(monday);
   await loadLessonLogsForWeek(monday);
@@ -734,7 +789,8 @@ async function toggleRecurring(ref, slotId, dateStr){
 }
 
 async function addExtraSlot({date, start_time, end_time, label}){
-  const payload = {calendar_id:S.selectedCalendarId, date, start_time, end_time, label: label||'Lezione extra'};
+  const effectiveCalId = S.selectedCalendarOverrideId || calendarForDate(date) || (S.calendars.length ? S.calendars[0].id : null);
+  const payload = {calendar_id:effectiveCalId, date, start_time, end_time, label: label||'Lezione extra'};
   if(!isGuest()) payload.created_by = myProfileId();
   const {error} = await sb.from('extra_slots').insert(payload);
   if(error){ toast('Errore aggiunta lezione extra.'); return; }
@@ -754,27 +810,66 @@ async function createCalendar(name, period){
   if(error){ toast('Errore creazione calendario.'); return; }
   closeModal();
   await loadCalendars();
-  S.selectedCalendarId = data.id;
-  await refreshWeekData();
+  if(S.calendars.length === 1){
+    await setActiveCalendar(data.id);
+  } else {
+    toast(`Calendario "${name}" creato.`);
+    await refreshWeekData();
+  }
 }
 
 async function setActiveCalendar(id){
-  const {error} = await sb.from('workspaces').update({active_calendar_id:id}).eq('id', S.workspace.id);
-  if(error){ toast('Errore.'); return; }
+  const today = todayISO();
+  // 1. Aggiorna workspace per retro-compatibilità
+  await sb.from('workspaces').update({active_calendar_id:id, scheduled_calendar_id:null, scheduled_calendar_date:null}).eq('id', S.workspace.id);
   S.workspace.active_calendar_id = id;
-  toast('Calendario impostato come attivo.');
-  render();
+  S.workspace.scheduled_calendar_id = null;
+  S.workspace.scheduled_calendar_date = null;
+
+  // 2. Inserisci o aggiorna il periodo in calendar_periods
+  try {
+    const existing = (S.calendarPeriods||[]).find(p=>p.start_date === today);
+    if(existing){
+      await sb.from('calendar_periods').update({calendar_id:id}).eq('id', existing.id);
+    } else {
+      await sb.from('calendar_periods').insert({workspace_id:S.workspace.id, calendar_id:id, start_date:today});
+    }
+  } catch(e){}
+
+  await loadCalendarPeriods();
+  toast('Calendario impostato come attivo da oggi.');
+  await refreshWeekData();
 }
 
 async function scheduleCalendarChange(calendarId, date){
   if(!calendarId || !date){ toast('Scegli calendario e data.'); return; }
+  const today = todayISO();
+  if(date <= today){
+    await setActiveCalendar(calendarId);
+    closeModal();
+    return;
+  }
+
+  // 1. Aggiorna campi workspace
   const {error} = await sb.from('workspaces').update({scheduled_calendar_id:calendarId, scheduled_calendar_date:date}).eq('id', S.workspace.id);
   if(error){ toast('Errore programmazione.'); return; }
   S.workspace.scheduled_calendar_id = calendarId;
   S.workspace.scheduled_calendar_date = date;
+
+  // 2. Inserisci o aggiorna in calendar_periods
+  try {
+    const existing = (S.calendarPeriods||[]).find(p=>p.start_date === date);
+    if(existing){
+      await sb.from('calendar_periods').update({calendar_id:calendarId}).eq('id', existing.id);
+    } else {
+      await sb.from('calendar_periods').insert({workspace_id:S.workspace.id, calendar_id:calendarId, start_date:date});
+    }
+  } catch(e){}
+
+  await loadCalendarPeriods();
   closeModal();
   toast('Cambio calendario programmato.');
-  render();
+  await refreshWeekData();
 }
 
 async function cancelScheduledCalendarChange(){
@@ -782,33 +877,70 @@ async function cancelScheduledCalendarChange(){
   if(error){ toast('Errore.'); return; }
   S.workspace.scheduled_calendar_id = null;
   S.workspace.scheduled_calendar_date = null;
+
+  try {
+    const today = todayISO();
+    await sb.from('calendar_periods').delete().eq('workspace_id', S.workspace.id).gt('start_date', today);
+  } catch(e){}
+
+  await loadCalendarPeriods();
   toast('Programmazione annullata.');
-  render();
+  await refreshWeekData();
 }
 
-// se una data programmata è arrivata (oggi o passata), attiva il calendario in coda.
-// controllato lato client all'apertura dell'app (non c'è un backend con cron).
 async function applyScheduledCalendarIfDue(){
   const ws = S.workspace;
-  if(!ws || !ws.scheduled_calendar_id || !ws.scheduled_calendar_date) return;
-  if(ws.scheduled_calendar_date > todayISO()) return;
-  const targetId = ws.scheduled_calendar_id;
-  const {error} = await sb.from('workspaces').update({active_calendar_id:targetId, scheduled_calendar_id:null, scheduled_calendar_date:null}).eq('id', ws.id);
-  if(error) return;
-  ws.active_calendar_id = targetId;
-  ws.scheduled_calendar_id = null;
-  ws.scheduled_calendar_date = null;
-  S.selectedCalendarId = targetId;
-  const cal = S.calendars.find(c=>c.id===targetId);
-  toast(`Calendario cambiato automaticamente in "${cal ? cal.name : ''}".`);
+  if(!ws) return;
+  const today = todayISO();
+
+  if(ws.scheduled_calendar_id && ws.scheduled_calendar_date && ws.scheduled_calendar_date <= today){
+    const targetId = ws.scheduled_calendar_id;
+    await sb.from('workspaces').update({
+      active_calendar_id: targetId,
+      scheduled_calendar_id: null,
+      scheduled_calendar_date: null
+    }).eq('id', ws.id);
+    ws.active_calendar_id = targetId;
+    ws.scheduled_calendar_id = null;
+    ws.scheduled_calendar_date = null;
+  }
+  await loadCalendarPeriods();
+}
+
+async function duplicateCalendar(sourceCalId, newName, newPeriod){
+  if(!newName || !newName.trim()){ toast('Inserisci un nome per il nuovo calendario.'); return; }
+  newName = newName.trim();
+  newPeriod = newPeriod || 'personalizzato';
+
+  const {data:newCal, error:e1} = await sb.from('calendars')
+    .insert({workspace_id:S.workspace.id, name:newName, period:newPeriod})
+    .select().single();
+  if(e1 || !newCal){ toast('Errore duplicazione calendario.'); return; }
+
+  const {data:srcSlots} = await sb.from('slots').select('*').eq('calendar_id', sourceCalId);
+  if(srcSlots && srcSlots.length > 0){
+    const toInsert = srcSlots.map(s => ({
+      calendar_id: newCal.id,
+      weekday: s.weekday,
+      start_time: s.start_time,
+      end_time: s.end_time,
+      label: s.label
+    }));
+    await sb.from('slots').insert(toInsert);
+  }
+
+  closeModal();
+  await loadCalendars();
+  await loadSlots();
+  toast(`Calendario "${newName}" duplicato con successo (${srcSlots ? srcSlots.length : 0} orari copiati).`);
+  openCalendarEditor(newCal);
 }
 
 async function deleteCalendar(id){
   const {error} = await sb.from('calendars').delete().eq('id', id);
   if(error){ toast('Errore eliminazione calendario.'); return; }
-  if(S.selectedCalendarId===id) S.selectedCalendarId = null;
+  if(S.selectedCalendarOverrideId===id) S.selectedCalendarOverrideId = null;
   await loadCalendars();
-  if(!S.selectedCalendarId && S.calendars.length) S.selectedCalendarId = S.calendars[0].id;
   await refreshWeekData();
 }
 
@@ -826,11 +958,10 @@ async function deleteSlot(id, calendarId){
 async function loadSlotsForEditor(calendarId){
   const {data} = await sb.from('slots').select('*').eq('calendar_id', calendarId).order('weekday').order('start_time');
   S.modal.editSlots = data || [];
-  if(calendarId===S.selectedCalendarId){
-    await loadSlots();
-    await loadExtraForWeek(mondayOf(S.weekOffset));
-    await loadAttendanceForWeek(mondayOf(S.weekOffset));
-  }
+  await loadSlots();
+  const monday = mondayOf(S.weekOffset);
+  await loadExtraForWeek(monday);
+  await loadAttendanceForWeek(monday);
   render();
 }
 
@@ -1125,10 +1256,13 @@ function renderShell(){
 function renderPresenze(){
   const d = document.createElement('div');
   const monday = mondayOf(S.weekOffset);
+  const curWeekCalId = getEffectiveCalendarForWeek(monday);
+  const curCal = S.calendars.find(c=>c.id===curWeekCalId);
 
   const calSelect = S.calendars.length ? `
-    <select class="calpick" id="calpick">
-      ${S.calendars.map(c=>`<option value="${c.id}" ${c.id===S.selectedCalendarId?'selected':''}>${esc(c.name)}</option>`).join('')}
+    <select class="calpick" id="calpick" title="Calendario visualizzato per questa settimana">
+      <option value="auto" ${!S.selectedCalendarOverrideId?'selected':''}>Auto (${esc(curCal?curCal.name:'Attivo')})</option>
+      ${S.calendars.map(c=>`<option value="${c.id}" ${S.selectedCalendarOverrideId===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
     </select>` : '';
 
   d.innerHTML = `
@@ -1161,7 +1295,11 @@ function renderPresenze(){
 
   if(calSelect){
     d.querySelector('#calpick').onchange = async (e)=>{
-      S.selectedCalendarId = e.target.value;
+      if(e.target.value === 'auto'){
+        S.selectedCalendarOverrideId = null;
+      } else {
+        S.selectedCalendarOverrideId = e.target.value;
+      }
       await refreshWeekData();
     };
   }
@@ -1226,8 +1364,13 @@ function attachSwipeWeekNav(el){
 function slotsForDate(dt){
   const wd = (dt.getDay()+6)%7;
   const dateStr = toISO(dt);
-  const weekly = S.slots.filter(s=>s.weekday===wd).map(s=>({ref:{slot_id:s.id}, label:s.label, start:s.start_time, end:s.end_time, extra:false, id:s.id}));
-  const extras = S.extraSlots.filter(e=>e.date===dateStr).map(e=>({ref:{extra_slot_id:e.id}, label:e.label, start:e.start_time, end:e.end_time, extra:true, id:e.id}));
+  const effectiveCalId = S.selectedCalendarOverrideId || calendarForDate(dateStr);
+  const weekly = S.slots
+    .filter(s=> s.calendar_id === effectiveCalId && s.weekday===wd)
+    .map(s=>({ref:{slot_id:s.id}, label:s.label, start:s.start_time, end:s.end_time, extra:false, id:s.id, calendar_id:s.calendar_id}));
+  const extras = S.extraSlots
+    .filter(e=> e.date===dateStr && (!e.calendar_id || e.calendar_id === effectiveCalId))
+    .map(e=>({ref:{extra_slot_id:e.id}, label:e.label, start:e.start_time, end:e.end_time, extra:true, id:e.id, calendar_id:e.calendar_id}));
   return weekly.concat(extras).sort((a,b)=> a.start.localeCompare(b.start));
 }
 
@@ -1353,37 +1496,48 @@ function renderCalendari(){
     d.appendChild(empty);
     return d;
   }
-  if(S.workspace.scheduled_calendar_id && S.workspace.scheduled_calendar_date){
-    const target = S.calendars.find(c=>c.id===S.workspace.scheduled_calendar_id);
+
+  const today = todayISO();
+  const futurePeriod = (S.calendarPeriods||[]).find(p=> p.start_date > today);
+  const schedCalId = futurePeriod ? futurePeriod.calendar_id : (S.workspace.scheduled_calendar_date > today ? S.workspace.scheduled_calendar_id : null);
+  const schedDate = futurePeriod ? futurePeriod.start_date : (S.workspace.scheduled_calendar_date > today ? S.workspace.scheduled_calendar_date : null);
+
+  if(schedCalId && schedDate){
+    const target = S.calendars.find(c=>c.id===schedCalId);
     const banner = document.createElement('div');
     banner.className = 'card';
     banner.style.background = '#FFF1E4';
     banner.innerHTML = `
       <div class="row between">
-        <div><b>Cambio programmato</b><div class="hint" style="margin-top:2px">Il calendario attivo passerà a <b>${esc(target?target.name:'')}</b> il ${new Date(S.workspace.scheduled_calendar_date).toLocaleDateString('it-IT')}.</div></div>
+        <div><b>🗓️ Cambio programmato</b><div class="hint" style="margin-top:2px">Il calendario passerà automaticamente a <b>${esc(target?target.name:'')}</b> a partire dal ${new Date(schedDate).toLocaleDateString('it-IT')}.</div></div>
         <button class="btn ghost sm" id="cancelSched">Annulla</button>
       </div>`;
     banner.querySelector('#cancelSched').onclick = ()=>{ if(confirm('Annullare il cambio calendario programmato?')) cancelScheduledCalendarChange(); };
     d.appendChild(banner);
   }
+
+  const activeTodayCalId = calendarForDate(today);
+
   S.calendars.forEach(c=>{
     const card = document.createElement('div');
     card.className = 'card';
-    const active = S.workspace.active_calendar_id===c.id;
+    const isActiveToday = activeTodayCalId === c.id;
     card.innerHTML = `
       <div class="row between">
-        <div><b>${esc(c.name)}</b> <span class="tag ${c.period}">${PERIOD_LABEL[c.period]||c.period}</span> ${active?'<span class="pill ok">Attivo</span>':''}</div>
+        <div><b>${esc(c.name)}</b> <span class="tag ${c.period}">${PERIOD_LABEL[c.period]||c.period}</span> ${isActiveToday?'<span class="pill ok">Attivo oggi</span>':''}</div>
       </div>
-      <div class="row" style="margin-top:10px">
-        ${!active?`<button class="btn secondary sm" data-act="mkactive">Rendi attivo</button>`:''}
-        ${!active?`<button class="btn secondary sm" data-act="sched">Programma cambio</button>`:''}
+      <div class="row wrap" style="margin-top:10px;gap:6px">
+        ${!isActiveToday?`<button class="btn secondary sm" data-act="mkactive">Rendi attivo oggi</button>`:''}
+        <button class="btn secondary sm" data-act="sched">Programma cambio</button>
+        <button class="btn secondary sm" data-act="dup">Duplica</button>
         <button class="btn secondary sm" data-act="edit">Modifica orari</button>
         <button class="btn ghost sm" data-act="del">Elimina</button>
       </div>`;
     card.querySelector('[data-act="edit"]').onclick = ()=> openCalendarEditor(c);
-    if(!active){
+    card.querySelector('[data-act="dup"]').onclick = ()=> openModal({type:'duplicate-calendar', calendarId:c.id});
+    card.querySelector('[data-act="sched"]').onclick = ()=> openModal({type:'schedule-calendar', calendarId:c.id});
+    if(!isActiveToday){
       card.querySelector('[data-act="mkactive"]').onclick = ()=> setActiveCalendar(c.id);
-      card.querySelector('[data-act="sched"]').onclick = ()=> openModal({type:'schedule-calendar', calendarId:c.id});
     }
     card.querySelector('[data-act="del"]').onclick = ()=>{ if(confirm(`Eliminare "${c.name}" e tutti i suoi orari?`)) deleteCalendar(c.id); };
     d.appendChild(card);
@@ -1657,18 +1811,41 @@ function renderModal(){
   }
 
   else if(m.type==='schedule-calendar'){
+    const target = S.calendars.find(c=>c.id===m.calendarId);
+    const defDate = nextMondayISO();
     box.innerHTML = `
       <div class="mhead"><h2>Programma cambio calendario</h2><button id="x">✕</button></div>
-      <p class="hint" style="margin:0 0 12px">Alla data scelta, questo calendario diventerà automaticamente quello attivo (al primo accesso all'app di un membro dello spazio da quella data in poi).</p>
-      <label class="field"><span>Data del cambio</span><input type="date" id="s_date" value="${todayISO()}"></label>
-      <button class="btn block" id="s_save">Programma</button>`;
+      <p class="hint" style="margin:0 0 12px">Passa automaticamente a <b>${esc(target?target.name:'questo calendario')}</b> a partire dalla data scelta. Tutte le settimane precedenti manterranno gli orari e le presenze del calendario precedente.</p>
+      <label class="field"><span>Data di inizio validità</span><input type="date" id="s_date" value="${defDate}" min="${todayISO()}"></label>
+      <button class="btn block" id="s_save">Programma cambio</button>`;
     box.querySelector('#s_save').onclick = ()=> scheduleCalendarChange(m.calendarId, box.querySelector('#s_date').value);
+  }
+
+  else if(m.type==='duplicate-calendar'){
+    const src = S.calendars.find(c=>c.id===m.calendarId);
+    const defName = src ? `${src.name} (nuovo)` : 'Nuovo calendario';
+    box.innerHTML = `
+      <div class="mhead"><h2>Duplica calendario</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 12px">Crea una copia di <b>${esc(src?src.name:'')}</b> con tutti i suoi orari settimanali. Potrai poi modificare solo gli orari che cambiano e programmare la data di inizio validità.</p>
+      <label class="field"><span>Nome nuovo calendario</span><input type="text" id="dc_name" value="${esc(defName)}"></label>
+      <label class="field"><span>Periodo</span>
+        <select id="dc_period">
+          <option value="inverno" ${src&&src.period==='inverno'?'selected':''}>Inverno</option>
+          <option value="estate" ${src&&src.period==='estate'?'selected':''}>Estate</option>
+          <option value="extra" ${src&&src.period==='extra'?'selected':''}>Extra</option>
+          <option value="personalizzato" ${src&&src.period==='personalizzato'?'selected':''}>Personalizzato</option>
+        </select>
+      </label>
+      <button class="btn block" id="dc_save">Duplica e modifica orari</button>`;
+    box.querySelector('#dc_save').onclick = ()=> duplicateCalendar(m.calendarId, box.querySelector('#dc_name').value, box.querySelector('#dc_period').value);
   }
 
   else if(m.type==='edit-calendar'){
     const cal = m.calendar;
+    const isCurrentlyActive = calendarForDate(todayISO()) === cal.id;
     box.innerHTML = `
       <div class="mhead"><h2>${esc(cal.name)}</h2><button id="x">✕</button></div>
+      ${isCurrentlyActive ? `<div class="hint" style="background:#FFF9E6;padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:13px;line-height:1.4">💡 <b>Nota:</b> Questo calendario è attualmente attivo. Se modifichi gli orari, il cambiamento si rifletterà sulle settimane in cui è valido. Se invece stai preparando il nuovo orario per la prossima stagione, ti consigliamo di usare <b>Duplica</b> dalla scheda Calendari e programmarne l'attivazione.</div>` : ''}
       <h3>Orari settimanali</h3>
       <div id="slotList" class="col" style="margin-bottom:14px"></div>
       <div class="row">

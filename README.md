@@ -78,9 +78,12 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 2. [`migration_workspace_mgmt_avatar.sql`](migration_workspace_mgmt_avatar.sql) — rinomina/elimina spazi,
    foto profilo.
 3. [`migration_scheduling_recurring.sql`](migration_scheduling_recurring.sql) — cambio calendario
-   programmato e presenza ricorrente (vedi sotto).
+   programmato e presenza ricorrente.
 4. [`migration_lesson_log.sql`](migration_lesson_log.sql) — registro lezione: gli istruttori possono
-   scrivere cosa hanno fatto in ogni lezione (vedi sotto).
+   scrivere cosa hanno fatto in ogni lezione.
+5. [`migration_calendar_periods.sql`](migration_calendar_periods.sql) — timeline periodi di validità dei
+   calendari: preserva gli orari e le presenze storiche nel passato e attiva automaticamente il nuovo calendario
+   a partire dalla data programmata.
 
 ## Come funziona
 
@@ -90,21 +93,18 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - **Accesso rapido (usa e getta)**: l'amministratore genera un link temporaneo (1/3/7 giorni) dalla
   scheda Istruttori. Chi apre il link inserisce solo il proprio nome e può subito segnare la presenza,
   senza creare un account.
-- **Calendari**: l'amministratore crea calendari per periodo (Estate/Inverno/Extra/Personalizzato),
-  imposta gli orari settimanali ricorrenti, e sceglie quale calendario è "attivo" (quello mostrato di
-  default). Tutti i calendari restano salvati e selezionabili dal menu a tendina in Presenze.
-- **Presenze**: vista a settimana, un tocco per segnare "presente" su ogni lezione (swipe a
-  sinistra/destra da mobile per cambiare settimana). Si possono aggiungere lezioni extra one-off
-  (es. lezioni private) su una data specifica. Di default è mostrata la "Vista di tutti" (presenze di
-  ogni istruttore e ospite), con un pulsante per passare alla vista personale.
+- **Calendari & Periodi di validità**: l'amministratore crea calendari per periodo (Estate/Inverno/Extra/Personalizzato),
+  imposta gli orari settimanali ricorrenti, e può programmarne l'attivazione a partire da una data specifica ("Programma cambio")
+  oppure renderli attivi immediatamente ("Rendi attivo oggi").
+- **Duplica calendario**: per creare un nuovo orario stagionale con 1 click, il pulsante **Duplica** clona un calendario esistente
+  con tutti i suoi orari settimanali, consentendo di ritoccare solo le differenze e programmarne la partenza.
+- **Presenze con risoluzione per data**: navigando tra le settimane nella vista Presenze (frecce, swipe da mobile, Oggi),
+  l'app carica automaticamente il calendario attivo in quella specifica settimana. Le settimane passate conservano
+  fedelmente i vecchi orari e tutte le presenze già registrate, mentre le settimane future a partire dalla data programmata
+  mostrano il nuovo orario.
 - **Più spazi con lo stesso account**: tocca il nome dello spazio in alto (o "Cambia o aggiungi spazio"
   nel Profilo) per vedere tutti gli spazi a cui appartieni, crearne uno nuovo, o entrare in un altro
   spazio con un codice invito — utile per chi gestisce più palestre/aziende/famiglie con un solo login.
-- **Cambio calendario programmato**: dalla scheda Calendari, un amministratore può programmare che un
-  calendario diventi automaticamente attivo a una data futura ("Programma cambio"). Il controllo avviene
-  lato client al primo accesso all'app da parte di un membro dello spazio a partire da quella data (non
-  c'è un backend con cron, quindi non scatta se nessuno apre l'app quel giorno — scatterà al primo
-  accesso successivo).
 - **Più amministratori**: dalla scheda Istruttori, un admin può promuovere un istruttore ad amministratore
   (o toglierlo) con il pulsante "Rendi admin" / "Rendi istruttore" sulla riga del membro.
 - **Presenza ricorrente**: nella vista Presenze, il pulsante 🔁 su un orario ricorrente segna quell'orario
@@ -130,5 +130,3 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - Rimuovere un istruttore toglie l'accesso allo spazio ma non cancella l'account Supabase sottostante.
 - La "Vista di tutti" per l'amministratore è di sola consultazione (non permette di segnare la presenza
   al posto di un altro istruttore) — coerente con le policy di sicurezza (RLS) del database.
-- Il cambio calendario programmato non scatta se nessuno apre l'app nel giorno previsto: scatta al primo
-  accesso successivo di un membro registrato (non funziona per gli accessi ospite).

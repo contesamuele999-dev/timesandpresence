@@ -44,6 +44,18 @@ alter table workspaces
 alter table workspaces
   add constraint fk_scheduled_calendar foreign key (scheduled_calendar_id) references calendars(id) on delete set null;
 
+-- ---------- CALENDAR PERIODS (timeline dei periodi di validità) ----------
+create table if not exists calendar_periods (
+  id uuid primary key default gen_random_uuid(),
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  calendar_id uuid not null references calendars(id) on delete cascade,
+  start_date date not null,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_calendar_periods_ws_date
+  on calendar_periods (workspace_id, start_date desc);
+
 -- ---------- SLOTS (orari settimanali ricorrenti di un calendario) ----------
 create table if not exists slots (
   id uuid primary key default gen_random_uuid(),
@@ -144,6 +156,7 @@ create unique index if not exists lesson_logs_unique_extra
 alter table workspaces enable row level security;
 alter table profiles enable row level security;
 alter table calendars enable row level security;
+alter table calendar_periods enable row level security;
 alter table slots enable row level security;
 alter table extra_slots enable row level security;
 alter table guest_links enable row level security;
@@ -193,6 +206,12 @@ create policy cal_select on calendars for select using (is_member(workspace_id))
 create policy cal_write on calendars for insert with check (my_role_in(workspace_id) = 'admin');
 create policy cal_update on calendars for update using (my_role_in(workspace_id) = 'admin');
 create policy cal_delete on calendars for delete using (my_role_in(workspace_id) = 'admin');
+
+-- calendar_periods: timeline periodi (lettura membri, gestione admin)
+create policy cp_select on calendar_periods for select using (is_member(workspace_id));
+create policy cp_insert on calendar_periods for insert with check (my_role_in(workspace_id) = 'admin');
+create policy cp_update on calendar_periods for update using (my_role_in(workspace_id) = 'admin');
+create policy cp_delete on calendar_periods for delete using (my_role_in(workspace_id) = 'admin');
 
 -- slots: lettura per chiunque membro (via join calendars), scrittura solo admin
 create policy slot_select on slots for select using (
