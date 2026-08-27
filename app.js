@@ -55,6 +55,12 @@ const S = {
   recurring: [],
   lessonLogs: [],       // registro lezione: cosa è stato fatto in ogni lezione/data
   showAllMatrix: false,
+  presenceSaving: false,
+  weekLoading: false,
+  weekLoadFailed: false,
+  presenceNeedsRefresh: false,
+  syncBusy: false,
+  dataError: null,
 
   instructors: [],
   guestLinks: [],
@@ -68,6 +74,7 @@ const S = {
 };
 
 let notificationChannel = null;
+let weekLoadVersion = 0;
 
 /* ---------------- PWA install + "ricordami" ---------------- */
 let deferredInstallPrompt = null;
@@ -335,6 +342,11 @@ async function deliverEventNotification(event){
 }
 async function handleAppEvent(event){
   if(!event || !event.id) return;
+  if(event.workspace_id && event.workspace_id!==S.workspace?.id) return;
+  // I ruoli arrivano dal profilo nel database, non dal token della sessione.
+  if(event.category==='members' && event.metadata?.record_id===myProfileId()){
+    await loadInstructors();
+  }
   localStorage.setItem(notificationCursorKey(), String(event.id));
   await deliverEventNotification(event);
 }
@@ -374,8 +386,102 @@ async function startNotificationListener(){
 }
 
 document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState==='visible' && S.view==='app' && !isGuest()) catchUpNotificationEvents();
+  if(document.visibilityState==='visible' && S.view==='app' && !isGuest()){
+    loadInstructors();
+    catchUpNotificationEvents();
+  }
 });
+
+function dataErrorMessage(error){
+  const code = error?.code || '';
+  if(code==='GUEST_EXPIRED') return 'Accesso rapido scaduto. Chiedi un nuovo link all’amministratore.';
+  if(code==='MEMBERSHIP_MISSING') return 'Non risulti più membro di questo spazio. Contatta l’amministratore.';
+  if(navigator.onLine===false || /fetch|network|offline/i.test(error?.message || '')){
+    return 'Connessione non disponibile. Riconnettiti e premi “Aggiorna dati” prima di riprovare.';
+  }
+  if(['PGRST301','PGRST302','PGRST303'].includes(code) || error?.status===401){
+    return 'Sessione scaduta. Esci e accedi di nuovo.';
+  }
+  if(code==='42501') return 'Permesso negato. Aggiorna i dati per verificare il tuo ruolo; puoi modificare solo le tue presenze.';
+  if(code==='PGRST116') return 'La riga non è stata modificata: potrebbe essere stata rimossa oppure non essere più accessibile. Aggiorna i dati.';
+  if(code==='23505') return 'Questa presenza è già stata salvata da un’altra sessione. Aggiorna i dati.';
+  if(code==='42703' && /record .* has no field/i.test(error?.message || '')){
+    return 'Errore del database nelle notifiche. L’amministratore deve rieseguire migration_notifications.sql aggiornato in Supabase.';
+  }
+  if(['42P01','42703','42883','PGRST204','PGRST205'].includes(code)){
+    return 'Il database richiede un aggiornamento. L’amministratore deve verificare le migrazioni SQL del progetto.';
+  }
+  return 'Operazione non completata. Aggiorna i dati prima di riprovare; se persiste, comunica il codice all’amministratore.';
+}
+
+function showDataError(error, action){
+  const code = String(error?.code || 'RETE_O_SERVER');
+  console.error('Presencer: '+action, error);
+  S.dataError = {action, code, message:dataErrorMessage(error)};
+  render();
+}
+
+async function checkedRows(query){
+  const {data, error} = await query;
+  if(error) throw error;
+  return data || [];
+}
+
+async function checkedRow(query){
+  const {data, error} = await query.single();
+  if(error) throw error;
+  if(!data) throw {code:'PGRST116'};
+  return data;
+}
+
+function presenceContext(){
+  return [S.workspace?.id, myProfileId(), S.guest?.token, S.weekOffset, S.selectedCalendarOverrideId].join('|');
+}
+
+function presenceControlsDisabled(){
+  return S.presenceSaving || S.weekLoading || S.weekLoadFailed || S.presenceNeedsRefresh || S.syncBusy;
+}
+
+async function runPresenceWrite(action, write){
+  if(presenceControlsDisabled()) return false;
+  const context = presenceContext();
+  S.presenceSaving = true;
+  S.dataError = null;
+  render();
+  try{
+    if(navigator.onLine===false) throw {message:'offline'};
+    if(isGuest() && new Date(S.guest.expires_at)<=new Date()) throw {code:'GUEST_EXPIRED'};
+    const apply = await write();
+    if(context===presenceContext()) apply();
+    return true;
+  }catch(error){
+    if(context===presenceContext()){
+      // Una risposta persa può nascondere una scrittura riuscita: rileggere prima
+      // di consentire un nuovo inserimento evita duplicati e falsi successi.
+      S.presenceNeedsRefresh = true;
+      showDataError(error, action);
+    }
+    return false;
+  }finally{
+    S.presenceSaving = false;
+    render();
+  }
+}
+
+async function refreshCurrentData(){
+  if(S.syncBusy || S.presenceSaving || !S.workspace) return;
+  S.syncBusy = true;
+  S.dataError = null;
+  render();
+  try{
+    if(!await loadInstructors()) return;
+    if(!await loadCalendars()) return;
+    await refreshWeekData();
+  }finally{
+    S.syncBusy = false;
+    render();
+  }
+}
 
 function toast(msg){
   S.toast = msg;
@@ -534,7 +640,8 @@ async function activateProfile(prof, reason){
   S.weekOffset = 0;
   S.selectedCalendarOverrideId = null;
   S.tab = 'presenze';
-  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = []; S.guestLinks = [];
+  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.lessonLogs = []; S.instructors = []; S.guestLinks = [];
+  S.dataError = null; S.weekLoadFailed = false; S.presenceNeedsRefresh = false;
   localStorage.setItem('activeWs_'+S.session.user.id, prof.workspace_id);
   S.view='app';
   render();
@@ -722,99 +829,106 @@ async function doLogout(){
 /* ---------------- data loaders ---------------- */
 async function loadCalendarPeriods(){
   if(!S.workspace){ S.calendarPeriods = []; return; }
+  const wsId = S.workspace.id;
   try {
-    const {data, error} = await sb.from('calendar_periods').select('*').eq('workspace_id', S.workspace.id).order('start_date', {ascending:true});
+    const {data, error} = await sb.from('calendar_periods').select('*').eq('workspace_id', wsId).order('start_date', {ascending:true});
+    if(S.workspace?.id!==wsId) return;
     if(!error && data){
       S.calendarPeriods = data;
     } else {
       S.calendarPeriods = [];
     }
   } catch(e){
-    S.calendarPeriods = [];
+    if(S.workspace?.id===wsId) S.calendarPeriods = [];
   }
 }
 
 async function loadCalendars(){
   const wsId = S.workspace.id;
-  const {data} = await sb.from('calendars').select('*').eq('workspace_id', wsId).order('created_at');
-  S.calendars = data || [];
-  await loadCalendarPeriods();
-  render();
-}
-
-async function loadSlots(){
-  const calIds = S.calendars.map(c=>c.id);
-  if(!calIds.length){ S.slots=[]; return; }
-  const {data} = await sb.from('slots').select('*').in('calendar_id', calIds).order('weekday').order('start_time');
-  S.slots = data || [];
-}
-
-async function loadExtraForWeek(monday){
-  const calIds = S.calendars.map(c=>c.id);
-  if(!calIds.length){ S.extraSlots=[]; return; }
-  const dates = weekDates(monday);
-  const from = toISO(dates[0]), to = toISO(dates[6]);
-  const {data} = await sb.from('extra_slots').select('*').in('calendar_id', calIds).gte('date', from).lte('date', to).order('date').order('start_time');
-  S.extraSlots = data || [];
-}
-
-async function loadAttendanceForWeek(monday){
-  const dates = weekDates(monday);
-  const from = toISO(dates[0]), to = toISO(dates[6]);
-  const slotIds = S.slots.map(s=>s.id);
-  const extraIds = S.extraSlots.map(s=>s.id);
-  let rows = [];
-  if(slotIds.length){
-    const {data} = await sb.from('attendance').select('*').in('slot_id', slotIds).gte('date', from).lte('date', to);
-    rows = rows.concat(data||[]);
+  try{
+    const data = await checkedRows(sb.from('calendars').select('*').eq('workspace_id', wsId).order('created_at'));
+    if(S.workspace?.id!==wsId) return false;
+    S.calendars = data;
+    await loadCalendarPeriods();
+    render();
+    return true;
+  }catch(error){
+    if(S.workspace?.id===wsId) showDataError(error, 'Caricamento calendari');
+    return false;
   }
-  if(extraIds.length){
-    const {data} = await sb.from('attendance').select('*').in('extra_slot_id', extraIds).gte('date', from).lte('date', to);
-    rows = rows.concat(data||[]);
-  }
-  S.attendance = rows;
-}
-
-async function loadRecurring(){
-  const slotIds = S.slots.map(s=>s.id);
-  if(!slotIds.length || isGuest()){ S.recurring = []; return; }
-  const {data} = await sb.from('recurring_presence').select('*').in('slot_id', slotIds);
-  S.recurring = data || [];
-}
-
-async function loadLessonLogsForWeek(monday){
-  if(isGuest()){ S.lessonLogs = []; return; }
-  const dates = weekDates(monday);
-  const from = toISO(dates[0]), to = toISO(dates[6]);
-  const slotIds = S.slots.map(s=>s.id);
-  const extraIds = S.extraSlots.map(s=>s.id);
-  let rows = [];
-  if(slotIds.length){
-    const {data} = await sb.from('lesson_logs').select('*').in('slot_id', slotIds).gte('date', from).lte('date', to);
-    rows = rows.concat(data||[]);
-  }
-  if(extraIds.length){
-    const {data} = await sb.from('lesson_logs').select('*').in('extra_slot_id', extraIds).gte('date', from).lte('date', to);
-    rows = rows.concat(data||[]);
-  }
-  S.lessonLogs = rows;
 }
 
 async function refreshWeekData(){
+  if(S.presenceSaving || !S.workspace) return false;
+  const version = ++weekLoadVersion;
+  const context = presenceContext();
+  const current = ()=> version===weekLoadVersion && context===presenceContext();
   const monday = mondayOf(S.weekOffset);
-  S.selectedCalendarId = getEffectiveCalendarForWeek(monday);
-  await loadSlots();
-  await loadRecurring();
-  await loadExtraForWeek(monday);
-  await loadAttendanceForWeek(monday);
-  await loadLessonLogsForWeek(monday);
+  const dates = weekDates(monday);
+  const from = toISO(dates[0]), to = toISO(dates[6]);
+  const calIds = S.calendars.map(c=>c.id);
+  const guest = isGuest();
+  S.weekLoading = true;
   render();
+  try{
+    const [slots, extraSlots] = await Promise.all([
+      calIds.length ? checkedRows(sb.from('slots').select('*').in('calendar_id', calIds).order('weekday').order('start_time')) : [],
+      calIds.length ? checkedRows(sb.from('extra_slots').select('*').in('calendar_id', calIds).gte('date', from).lte('date', to).order('date').order('start_time')) : [],
+    ]);
+    const slotIds = slots.map(s=>s.id), extraIds = extraSlots.map(s=>s.id);
+    const datedRows = (table, column, ids)=> ids.length
+      ? checkedRows(sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
+    const [attendance, extraAttendance, recurring, logs, extraLogs] = await Promise.all([
+      datedRows('attendance', 'slot_id', slotIds),
+      datedRows('attendance', 'extra_slot_id', extraIds),
+      !guest && slotIds.length ? checkedRows(sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
+      guest ? [] : datedRows('lesson_logs', 'slot_id', slotIds),
+      guest ? [] : datedRows('lesson_logs', 'extra_slot_id', extraIds),
+    ]);
+    if(!current()) return false;
+    // Pubblica una fotografia completa: mai una settimana parziale o la risposta
+    // tardiva di una settimana/spazio che l'utente ha già lasciato.
+    Object.assign(S, {slots, extraSlots, recurring, attendance:attendance.concat(extraAttendance), lessonLogs:logs.concat(extraLogs)});
+    S.selectedCalendarId = getEffectiveCalendarForWeek(monday);
+    S.weekLoadFailed = false;
+    S.presenceNeedsRefresh = false;
+    return true;
+  }catch(error){
+    if(current()){
+      S.weekLoadFailed = true;
+      showDataError(error, 'Caricamento presenze');
+    }
+    return false;
+  }finally{
+    if(version===weekLoadVersion) S.weekLoading = false;
+    render();
+  }
 }
 
 async function loadInstructors(){
-  const {data} = await sb.from('profiles').select('*').eq('workspace_id', S.workspace.id).order('role').order('name');
-  S.instructors = data || [];
-  render();
+  if(!S.workspace) return false;
+  const wsId = S.workspace.id;
+  const profileId = myProfileId();
+  try{
+    const data = await checkedRows(sb.from('profiles').select('*').eq('workspace_id', wsId).order('role').order('name'));
+    if(S.workspace?.id!==wsId || profileId!==myProfileId()) return false;
+    if(!isGuest()){
+      const me = data.find(p=>p.id===profileId);
+      if(!me) throw {code:'MEMBERSHIP_MISSING'};
+      S.profile = me;
+      S.myProfiles = S.myProfiles.map(p=>p.id===me.id ? me : p);
+      if(!isAdmin() && ['calendari','istruttori'].includes(S.tab)) S.tab='presenze';
+    }
+    S.instructors = data;
+    if(!S.modal) render();
+    return true;
+  }catch(error){
+    if(S.workspace?.id===wsId && profileId===myProfileId()){
+      S.presenceNeedsRefresh = true;
+      showDataError(error, 'Aggiornamento membri e ruolo');
+    }
+    return false;
+  }
 }
 
 async function loadGuestLinks(){
@@ -918,37 +1032,26 @@ async function deleteLessonLog(logId){
 }
 
 async function setAttendanceStatus(ref, dateStr, status){
-  const existing = findMyAttendance(ref, dateStr);
-  if(existing){
-    S.attendance = S.attendance.map(a=> a.id===existing.id ? Object.assign({}, a, {status}) : a);
-    render();
-    const {error} = await sb.from('attendance').update({status}).eq('id', existing.id);
-    if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
-  } else {
-    const tempId = 'tmp_'+Math.random();
+  return runPresenceWrite('Salvataggio presenza', async ()=>{
+    const existing = findMyAttendance(ref, dateStr);
+    if(existing){
+      const data = await checkedRow(sb.from('attendance').update({status}).eq('id', existing.id).select());
+      return ()=>{ S.attendance = S.attendance.map(a=>a.id===existing.id ? data : a); };
+    }
     const payload = Object.assign({date:dateStr, status}, ref,
       isGuest() ? {guest_token:S.guest.token, guest_name:S.guest.name} : {instructor_id:myProfileId()});
-    S.attendance.push(Object.assign({id:tempId}, payload));
-    render();
-    const {data, error} = await sb.from('attendance').insert(payload).select().single();
-    if(error){
-      S.attendance = S.attendance.filter(a=>a.id!==tempId);
-      toast('Errore, riprova.');
-      render();
-    } else {
-      const idx = S.attendance.findIndex(a=>a.id===tempId);
-      if(idx>=0) S.attendance[idx]=data;
-    }
-  }
+    const data = await checkedRow(sb.from('attendance').insert(payload).select());
+    return ()=>{ S.attendance.push(data); };
+  });
 }
 
 async function clearAttendance(ref, dateStr){
   const existing = findMyAttendance(ref, dateStr);
   if(!existing) return;
-  S.attendance = S.attendance.filter(a=>a.id!==existing.id);
-  render();
-  const {error} = await sb.from('attendance').delete().eq('id', existing.id);
-  if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
+  return runPresenceWrite('Rimozione presenza', async ()=>{
+    await checkedRow(sb.from('attendance').delete().eq('id', existing.id).select('id'));
+    return ()=>{ S.attendance = S.attendance.filter(a=>a.id!==existing.id); };
+  });
 }
 
 // ciclo al tocco: senza ricorrenza → non segnato → presente → assente → non segnato.
@@ -964,32 +1067,25 @@ async function cycleAttendance(ref, dateStr){
 
 async function toggleRecurring(ref, slotId, dateStr){
   if(isGuest()) return;
-  const existing = S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===myProfileId());
-  if(existing){
-    S.recurring = S.recurring.filter(r=>r.id!==existing.id);
-    render();
-    const {error} = await sb.from('recurring_presence').delete().eq('id', existing.id);
-    if(error){ toast('Errore, riprova.'); await refreshWeekData(); }
-    else toast('Presenza ricorrente disattivata.');
-  } else {
+  return runPresenceWrite('Salvataggio ricorrenza', async ()=>{
+    const existing = S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===myProfileId());
+    if(existing){
+      await checkedRow(sb.from('recurring_presence').delete().eq('id', existing.id).select('id'));
+      return ()=>{
+        S.recurring = S.recurring.filter(r=>r.id!==existing.id);
+        toast('Presenza ricorrente disattivata.');
+      };
+    }
     // replica lo stato attualmente impostato su questo orario (presente/assente),
     // di default 'presente' se non ancora segnato.
     const cur = findMyAttendance(ref, dateStr);
     const status = cur ? cur.status : 'presente';
-    const tempId = 'tmp_'+Math.random();
-    S.recurring.push({id:tempId, slot_id:slotId, instructor_id:myProfileId(), status});
-    render();
-    const {data, error} = await sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId(), status}).select().single();
-    if(error){
-      S.recurring = S.recurring.filter(r=>r.id!==tempId);
-      toast('Errore, riprova.');
-      render();
-    } else {
-      const idx = S.recurring.findIndex(r=>r.id===tempId);
-      if(idx>=0) S.recurring[idx]=data;
+    const data = await checkedRow(sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId(), status}).select());
+    return ()=>{
+      S.recurring.push(data);
       toast('Presenza ricorrente attivata: segnato "'+status+'" ogni settimana su questo orario.');
-    }
-  }
+    };
+  });
 }
 
 async function addExtraSlot({date, start_time, end_time, label}){
@@ -1003,9 +1099,19 @@ async function addExtraSlot({date, start_time, end_time, label}){
 }
 
 async function deleteExtraSlot(id){
-  const {error} = await sb.from('extra_slots').delete().eq('id', id);
-  if(error){ toast('Errore eliminazione.'); return; }
-  await refreshWeekData();
+  const extra = S.extraSlots.find(row=>row.id===id);
+  if(!extra || isGuest() || (!isAdmin() && extra.created_by!==myProfileId())){
+    showDataError({code:'42501'}, 'Eliminazione lezione extra');
+    return false;
+  }
+  return runPresenceWrite('Eliminazione lezione extra', async ()=>{
+    await checkedRow(sb.from('extra_slots').delete().eq('id', id).select('id'));
+    return ()=>{
+      S.extraSlots = S.extraSlots.filter(row=>row.id!==id);
+      S.attendance = S.attendance.filter(row=>row.extra_slot_id!==id);
+      S.lessonLogs = S.lessonLogs.filter(row=>row.extra_slot_id!==id);
+    };
+  });
 }
 
 /* ---------------- calendar/slot management (admin) ---------------- */
@@ -1223,10 +1329,16 @@ async function removeInstructor(id){
 }
 
 async function setInstructorRole(id, role){
-  const {error} = await sb.from('profiles').update({role}).eq('id', id);
-  if(error){ toast('Errore.'); return; }
-  toast(role==='admin' ? 'Ora è amministratore.' : 'Ora è istruttore.');
-  await loadInstructors();
+  if(!isAdmin() || !['admin','instructor'].includes(role)) return;
+  const wsId = S.workspace.id;
+  try{
+    await checkedRow(sb.from('profiles').update({role}).eq('id', id).eq('workspace_id', wsId).select());
+    if(S.workspace?.id!==wsId) return;
+    toast(role==='admin' ? 'Ora è amministratore.' : 'Ora è istruttore.');
+    await loadInstructors();
+  }catch(error){
+    if(S.workspace?.id===wsId) showDataError(error, 'Cambio ruolo');
+  }
 }
 
 async function createGuestLink(label, hours){
@@ -1404,6 +1516,17 @@ function renderInstallBar(mode, aboveTab){
   return bar;
 }
 
+function renderDataError(){
+  const panel = document.createElement('section');
+  panel.className = 'data-error';
+  panel.setAttribute('role', 'alert');
+  panel.innerHTML = `<b>${esc(S.dataError.action)}</b><p>${esc(S.dataError.message)}</p>
+    <small>Codice: ${esc(S.dataError.code)}</small>
+    <button class="btn secondary sm" ${S.syncBusy || S.presenceSaving ? 'disabled' : ''}>Aggiorna dati</button>`;
+  panel.querySelector('button').onclick = refreshCurrentData;
+  return panel;
+}
+
 function renderShell(){
   const wrap = document.createElement('div');
 
@@ -1426,6 +1549,7 @@ function renderShell(){
 
   // main
   const main = document.createElement('main');
+  if(S.dataError) main.appendChild(renderDataError());
   if(S.tab==='presenze') main.appendChild(renderPresenze());
   if(S.tab==='calendari') main.appendChild(renderCalendari());
   if(S.tab==='istruttori') main.appendChild(renderIstruttori());
@@ -1464,7 +1588,7 @@ function renderPresenze(){
   const curCal = S.calendars.find(c=>c.id===curWeekCalId);
 
   const calSelect = S.calendars.length ? `
-    <select class="calpick" id="calpick" title="Calendario visualizzato per questa settimana">
+    <select class="calpick" id="calpick" title="Calendario visualizzato per questa settimana" ${S.presenceSaving || S.syncBusy ? 'disabled' : ''}>
       <option value="auto" ${!S.selectedCalendarOverrideId?'selected':''}>Auto (${esc(curCal?curCal.name:'Attivo')})</option>
       ${S.calendars.map(c=>`<option value="${c.id}" ${S.selectedCalendarOverrideId===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}
     </select>` : '';
@@ -1474,27 +1598,33 @@ function renderPresenze(){
       <h1 style="margin:0">Presenze</h1>
       ${calSelect}
     </div>
+    <div class="row presence-sync">
+      <button class="btn secondary sm" id="refreshData" ${S.presenceSaving || S.syncBusy || S.weekLoading ? 'disabled' : ''}>Aggiorna dati</button>
+      <span class="hint" role="status">${S.presenceSaving ? 'Salvataggio in corso…' : S.syncBusy || S.weekLoading ? 'Aggiornamento in corso…' : ''}</span>
+    </div>
     ${S.calendars.length===0 ? `
       <div class="card empty"><div class="big">🗓️</div>
         ${isAdmin() ? 'Nessun calendario ancora. Vai su <b>Calendari</b> per crearne uno.' : 'Nessun calendario è stato ancora creato per questo spazio.'}
       </div>` : `
       <div class="weeknav">
-        <button class="arrow" id="wkPrev">‹</button>
+        <button class="arrow" id="wkPrev" aria-label="Settimana precedente" ${S.presenceSaving || S.syncBusy ? 'disabled' : ''}>‹</button>
         <div class="wk${S.navDir==='next'?' wk-in-right':S.navDir==='prev'?' wk-in-left':''}">${fmtRange(monday)}<small>${S.weekOffset===0?'Questa settimana':(S.weekOffset>0?'Tra '+S.weekOffset+' settiman'+(S.weekOffset>1?'e':'a'):S.weekOffset+' settimane fa')}</small></div>
-        <button class="arrow" id="wkNext">›</button>
+        <button class="arrow" id="wkNext" aria-label="Settimana successiva" ${S.presenceSaving || S.syncBusy ? 'disabled' : ''}>›</button>
       </div>
       <div class="row" style="margin-bottom:14px">
-        <button class="btn secondary sm" id="wkToday">Oggi</button>
-        <button class="btn secondary sm" id="addExtraBtn">+ Lezione extra</button>
+        <button class="btn secondary sm" id="wkToday" ${S.presenceSaving || S.syncBusy ? 'disabled' : ''}>Oggi</button>
+        <button class="btn secondary sm" id="addExtraBtn" ${presenceControlsDisabled() ? 'disabled' : ''}>+ Lezione extra</button>
         <div class="segbtns" id="viewSeg">
           <button data-v="mine" class="${!S.showAllMatrix?'on':''}">Personale</button>
           <button data-v="all" class="${S.showAllMatrix?'on':''}">Tutti</button>
         </div>
       </div>
+      ${S.showAllMatrix ? '<p class="hint">La vista Tutti è di sola consultazione. Per modificare le tue presenze scegli Personale.</p>' : ''}
       <div id="daysHost"></div>
     `}
   `;
 
+  d.querySelector('#refreshData').onclick = refreshCurrentData;
   if(S.calendars.length===0) return d;
 
   if(calSelect){
@@ -1523,6 +1653,10 @@ function renderPresenze(){
   });
 
   const host = d.querySelector('#daysHost');
+  if(S.weekLoading || S.weekLoadFailed){
+    host.innerHTML = `<p class="hint" role="status">${S.weekLoading ? 'Caricamento presenze…' : 'Presenze non disponibili. Premi “Aggiorna dati” per riprovare.'}</p>`;
+    return d;
+  }
   const dates = weekDates(monday);
   dates.forEach(dt=>{
     host.appendChild(S.showAllMatrix ? renderDayMatrix(dt) : renderDayList(dt));
@@ -1547,6 +1681,7 @@ function attachSwipeWeekNav(el){
     } else { maxScroll = 0; }
   }, {passive:true});
   el.addEventListener('touchend', e=>{
+    if(S.presenceSaving || S.syncBusy) return;
     if(sx===null) return;
     const dx = e.changedTouches[0].clientX - sx;
     const dy = e.changedTouches[0].clientY - sy;
@@ -1574,7 +1709,7 @@ function slotsForDate(dt){
     .map(s=>({ref:{slot_id:s.id}, label:s.label, start:s.start_time, end:s.end_time, extra:false, id:s.id, calendar_id:s.calendar_id}));
   const extras = S.extraSlots
     .filter(e=> e.date===dateStr && (!e.calendar_id || e.calendar_id === effectiveCalId))
-    .map(e=>({ref:{extra_slot_id:e.id}, label:e.label, start:e.start_time, end:e.end_time, extra:true, id:e.id, calendar_id:e.calendar_id}));
+    .map(e=>({ref:{extra_slot_id:e.id}, label:e.label, start:e.start_time, end:e.end_time, extra:true, id:e.id, calendar_id:e.calendar_id, created_by:e.created_by}));
   return weekly.concat(extras).sort((a,b)=> a.start.localeCompare(b.start));
 }
 
@@ -1604,9 +1739,9 @@ function renderDayList(dt){
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
       <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}</div></div>
       ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
-      ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Presente ogni settimana su questo orario">🔁</button>` : ''}
-      <button class="togglebtn ${btnClass}">${btnLabel}</button>
-      ${it.extra && (isAdmin() || S.profile) ? `<button class="btn ghost sm" data-del="${it.id}">✕</button>` : ''}
+      ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Ripeti lo stato ogni settimana su questo orario" ${presenceControlsDisabled() ? 'disabled' : ''}>🔁</button>` : ''}
+      <button class="togglebtn ${btnClass}" ${presenceControlsDisabled() ? 'disabled' : ''}>${btnLabel}</button>
+      ${it.extra && (isAdmin() || (S.profile && it.created_by===myProfileId())) ? `<button class="btn ghost sm" data-del="${it.id}" aria-label="Elimina lezione extra" ${presenceControlsDisabled() ? 'disabled' : ''}>✕</button>` : ''}
     `;
     row.querySelector('.togglebtn').onclick = ()=> cycleAttendance(it.ref, dateStr);
     const logBtn = row.querySelector('.logbtn');

@@ -1,7 +1,11 @@
 -- ============================================================
 -- Presencer — notifiche granulari per modifiche nello spazio
 -- Esegui una volta in Supabase → SQL Editor → New query → Run
+-- Aggiornamento 27/08/2026: rieseguibile per correggere il trigger delle presenze.
+-- Non modifica né cancella presenze, utenti o preferenze esistenti.
 -- ============================================================
+
+begin;
 
 create table if not exists notification_preferences (
   profile_id uuid primary key references profiles(id) on delete cascade,
@@ -80,10 +84,13 @@ begin
     if tg_op = 'DELETE' then return old; else return new; end if;
   end if;
 
-  if tg_table_name = 'profiles' and tg_op = 'UPDATE'
-     and new.name is not distinct from old.name
-     and new.role is not distinct from old.role then
-    return new;
+  -- Non accedere ai campi di profiles dentro una condizione condivisa:
+  -- PostgreSQL risolve NEW.name/role anche per tabelle che non li contengono.
+  if tg_table_name = 'profiles' and tg_op = 'UPDATE' then
+    if new.name is not distinct from old.name
+       and new.role is not distinct from old.role then
+      return new;
+    end if;
   end if;
 
   case tg_table_name
@@ -251,4 +258,4 @@ begin
     alter publication supabase_realtime add table app_events;
   end if;
 end $$;
-
+commit;

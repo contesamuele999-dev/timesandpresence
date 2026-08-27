@@ -87,6 +87,23 @@ push su `main` in automatico. Se non hai modifiche da pubblicare te lo dice e no
 > (Network tab), la vera protezione dei dati sono le regole RLS nel database, non la segretezza
 > della chiave.
 
+## Correzione errore sulle presenze (27 agosto 2026)
+
+Se il salvataggio mostra “Errore, riprova”, **riesegui il file aggiornato
+[`migration_notifications.sql`](migration_notifications.sql) nell’SQL Editor di Supabase**,
+anche se era già stato eseguito. Il trigger precedente cercava `NEW.name` e `NEW.role`
+nelle presenze, che non hanno questi campi, e PostgreSQL annullava la scrittura.
+Il problema riguarda sia istruttori sia amministratori. Lo script è riapplicabile e
+non cancella i dati esistenti; pubblicare soltanto il client non corregge il trigger sul server.
+
+Il client aggiornato blocca i doppi tocchi durante il salvataggio, verifica la conferma
+del server, aggiorna il ruolo al ritorno nell’app e mostra errori persistenti con codice.
+Il pulsante **Aggiorna dati** ricarica membri, ruolo, calendari e presenze.
+
+Per ripetere i controlli: `npm test`. Per la prova visuale senza dati reali:
+`npm run test:ui -- 8787`, quindi apri `http://127.0.0.1:8787`.
+Dettagli, limiti della verifica e passaggi di rilascio in [`DEBUG_PRESENZE.md`](DEBUG_PRESENZE.md).
+
 ## Migrazioni (se hai già eseguito schema.sql in passato)
 
 Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
