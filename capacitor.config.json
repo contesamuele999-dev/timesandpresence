@@ -1,0 +1,12 @@
+{
+  "appId": "it.presencer.app",
+  "appName": "Presencer",
+  "webDir": "www",
+  "backgroundColor": "#F6F5F3",
+  "plugins": {
+    "LocalNotifications": {
+      "iconColor": "#E86B00"
+    }
+  }
+}
+

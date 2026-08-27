@@ -8,6 +8,23 @@ const APP = document.getElementById('app');
 const WEEKDAYS = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'];
 const MONTHS = ['gen','feb','mar','apr','mag','giu','lug','ago','set','ott','nov','dic'];
 const PERIOD_LABEL = {estate:'Estate', inverno:'Inverno', extra:'Extra', personalizzato:'Personalizzato'};
+const NOTIFICATION_TYPES = [
+  {id:'attendance', label:'Presenze e assenze', description:'Quando una presenza viene aggiunta, cambiata o rimossa.'},
+  {id:'recurring', label:'Presenze ricorrenti', description:'Quando cambia una presenza settimanale ricorrente.'},
+  {id:'schedule', label:'Orari e lezioni', description:'Quando viene aggiunto, modificato o eliminato un orario.'},
+  {id:'calendar', label:'Calendari', description:'Quando cambia un calendario o la sua data di attivazione.'},
+  {id:'lesson_log', label:'Registri lezione', description:'Quando viene modificata una voce del registro.'},
+  {id:'members', label:'Membri', description:'Quando entra, cambia ruolo o viene rimosso un membro.'},
+];
+const DEFAULT_NOTIFICATION_PREFERENCES = {
+  enabled:false,
+  attendance:true,
+  recurring:true,
+  schedule:true,
+  calendar:true,
+  lesson_log:true,
+  members:true,
+};
 
 let sb = null;
 const S = {
@@ -42,9 +59,15 @@ const S = {
   instructors: [],
   guestLinks: [],
 
+  notificationPreferences: Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES),
+  notificationPermission: 'prompt', // prompt | granted | denied | unavailable
+  notificationSetupMissing: false,
+
   modal: null,          // {type, ...data}
   toast: '',
 };
+
+let notificationChannel = null;
 
 /* ---------------- PWA install + "ricordami" ---------------- */
 let deferredInstallPrompt = null;
@@ -184,6 +207,176 @@ window.resetInstall = function(){
   console.log('Flag install azzerati. Ricarica la pagina.');
 };
 
+/* ---------------- notifiche eventi ---------------- */
+function notificationPrefsKey(){
+  return S.profile ? `notificationPrefs_${S.profile.id}` : 'notificationPrefs';
+}
+function notificationCursorKey(){
+  return S.profile ? `notificationCursor_${S.profile.id}` : 'notificationCursor';
+}
+function nativeNotifications(){
+  return window.PresencerNative && window.PresencerNative.isNative ? window.PresencerNative : null;
+}
+function readLocalNotificationPreferences(){
+  try{
+    const saved = JSON.parse(localStorage.getItem(notificationPrefsKey()) || '{}');
+    return Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES, saved);
+  }catch(e){
+    return Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES);
+  }
+}
+function persistLocalNotificationPreferences(){
+  localStorage.setItem(notificationPrefsKey(), JSON.stringify(S.notificationPreferences));
+}
+async function refreshNotificationPermission(){
+  try{
+    const native = nativeNotifications();
+    if(native) S.notificationPermission = await native.checkPermission();
+    else if(!('Notification' in window)) S.notificationPermission = 'unavailable';
+    else S.notificationPermission = Notification.permission;
+  }catch(e){
+    S.notificationPermission = 'unavailable';
+  }
+}
+async function loadNotificationPreferences(){
+  S.notificationPreferences = readLocalNotificationPreferences();
+  S.notificationSetupMissing = false;
+  await refreshNotificationPermission();
+  try{
+    const {data, error} = await sb.from('notification_preferences')
+      .select('*').eq('profile_id', S.profile.id).maybeSingle();
+    if(error){
+      if(error.code==='42P01' || error.code==='PGRST205') S.notificationSetupMissing = true;
+      return;
+    }
+    if(data){
+      NOTIFICATION_TYPES.forEach(t=>{ S.notificationPreferences[t.id] = data[t.id] !== false; });
+      S.notificationPreferences.enabled = data.enabled === true;
+      persistLocalNotificationPreferences();
+    }
+  }catch(e){}
+}
+async function saveNotificationPreferences(){
+  persistLocalNotificationPreferences();
+  if(!S.profile) return;
+  const payload = {profile_id:S.profile.id, enabled:!!S.notificationPreferences.enabled};
+  NOTIFICATION_TYPES.forEach(t=>{ payload[t.id] = !!S.notificationPreferences[t.id]; });
+  try{
+    const {error} = await sb.from('notification_preferences').upsert(payload, {onConflict:'profile_id'});
+    if(error && (error.code==='42P01' || error.code==='PGRST205')) S.notificationSetupMissing = true;
+  }catch(e){}
+}
+async function enableDeviceNotifications(){
+  try{
+    const native = nativeNotifications();
+    let permission;
+    if(native) permission = await native.requestPermission();
+    else if('Notification' in window) permission = await Notification.requestPermission();
+    else permission = 'unavailable';
+    S.notificationPermission = permission;
+    if(permission==='granted'){
+      S.notificationPreferences.enabled = true;
+      await saveNotificationPreferences();
+      toast('Notifiche attivate.');
+    } else {
+      S.notificationPreferences.enabled = false;
+      await saveNotificationPreferences();
+      toast(permission==='denied' ? 'Notifiche bloccate nelle impostazioni del dispositivo.' : 'Notifiche non disponibili.');
+    }
+    render();
+  }catch(e){
+    toast('Impossibile attivare le notifiche.');
+  }
+}
+async function setNotificationPreference(key, enabled){
+  S.notificationPreferences[key] = !!enabled;
+  if(key==='enabled' && enabled && S.notificationPermission!=='granted'){
+    await enableDeviceNotifications();
+    return;
+  }
+  await saveNotificationPreferences();
+  render();
+}
+function notificationPermissionText(){
+  if(S.notificationPermission==='granted') return 'Autorizzate dal dispositivo';
+  if(S.notificationPermission==='denied') return 'Bloccate dal dispositivo: riattivale dalle impostazioni dell’app';
+  if(S.notificationPermission==='unavailable') return 'Non disponibili su questo dispositivo o browser';
+  return 'Serve la tua autorizzazione';
+}
+async function deliverEventNotification(event){
+  const prefs = S.notificationPreferences;
+  if(!prefs.enabled || !prefs[event.category]) return;
+  if(event.actor_profile_id && S.profile && event.actor_profile_id===S.profile.id) return;
+
+  const native = nativeNotifications();
+  try{
+    if(native && S.notificationPermission==='granted'){
+      await native.notify({
+        id:event.id,
+        category:event.category,
+        title:event.title || 'Presencer',
+        body:event.body || 'Un evento è stato modificato.',
+      });
+    } else if(S.notificationPermission==='granted' && document.visibilityState!=='visible'){
+      const options = {
+        body:event.body || 'Un evento è stato modificato.',
+        icon:'./icons/icon-192.png',
+        badge:'./icons/icon-192.png',
+        tag:`presencer-${event.id}`,
+        data:{url:'./'},
+      };
+      const reg = navigator.serviceWorker ? await navigator.serviceWorker.getRegistration() : null;
+      if(reg) await reg.showNotification(event.title || 'Presencer', options);
+      else new Notification(event.title || 'Presencer', options);
+    }
+  }catch(e){ console.warn('Notifica non mostrata', e); }
+
+  if(document.visibilityState==='visible') toast(`${event.title}: ${event.body}`);
+}
+async function handleAppEvent(event){
+  if(!event || !event.id) return;
+  localStorage.setItem(notificationCursorKey(), String(event.id));
+  await deliverEventNotification(event);
+}
+async function catchUpNotificationEvents(){
+  if(!S.profile || !S.workspace) return;
+  const cursor = localStorage.getItem(notificationCursorKey());
+  try{
+    if(!cursor){
+      const {data, error} = await sb.from('app_events').select('id')
+        .eq('workspace_id', S.workspace.id).order('id', {ascending:false}).limit(1);
+      if(error){
+        if(error.code==='42P01' || error.code==='PGRST205') S.notificationSetupMissing = true;
+        return;
+      }
+      if(data && data[0]) localStorage.setItem(notificationCursorKey(), String(data[0].id));
+      return;
+    }
+    const {data, error} = await sb.from('app_events').select('*')
+      .eq('workspace_id', S.workspace.id).gt('id', cursor).order('id', {ascending:true}).limit(10);
+    if(error) return;
+    for(const event of (data||[])) await handleAppEvent(event);
+  }catch(e){}
+}
+async function startNotificationListener(){
+  if(notificationChannel){
+    try{ await sb.removeChannel(notificationChannel); }catch(e){}
+    notificationChannel = null;
+  }
+  if(!S.profile || !S.workspace) return;
+  await catchUpNotificationEvents();
+  notificationChannel = sb.channel(`app-events-${S.profile.id}`)
+    .on('postgres_changes', {
+      event:'INSERT', schema:'public', table:'app_events',
+      filter:`workspace_id=eq.${S.workspace.id}`,
+    }, payload=> handleAppEvent(payload.new))
+    .subscribe();
+}
+
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible' && S.view==='app' && !isGuest()) catchUpNotificationEvents();
+});
+
 function toast(msg){
   S.toast = msg;
   render();
@@ -289,7 +482,11 @@ function boot(){
 
   sb.auth.onAuthStateChange((event, session)=>{
     if(event==='TOKEN_REFRESHED' || event==='USER_UPDATED') { S.session=session; return; }
-    if(event==='SIGNED_OUT'){ S.session=null; S.profile=null; S.workspace=null; S.view='auth'; render(); return; }
+    if(event==='SIGNED_OUT'){
+      if(notificationChannel) sb.removeChannel(notificationChannel).catch(()=>{});
+      notificationChannel = null;
+      S.session=null; S.profile=null; S.workspace=null; S.view='auth'; render(); return;
+    }
     if(session && (!S.session || S.session.user.id!==session.user.id)){
       S.session=session; handleSignedIn();
     }
@@ -345,6 +542,9 @@ async function activateProfile(prof, reason){
   await applyScheduledCalendarIfDue();
   await loadInstructors();
   await refreshWeekData();
+  await loadNotificationPreferences();
+  render();
+  await startNotificationListener();
   if(reason==='login' && S.myProfiles.length>1) toast(`Sei in "${ws.name}" — tocca il nome in alto per cambiare spazio.`);
   else if(reason==='switch') toast(`Passato a "${ws.name}".`);
   else if(reason==='created') toast(`Nuovo spazio "${ws.name}" creato.`);
@@ -510,6 +710,10 @@ async function doChangePassword(pass1, pass2){
 }
 
 async function doLogout(){
+  if(notificationChannel){
+    try{ await sb.removeChannel(notificationChannel); }catch(e){}
+    notificationChannel = null;
+  }
   await sb.auth.signOut();
   S.profile=null; S.workspace=null; S.view='auth'; S.tab='presenze';
   render();
@@ -1680,6 +1884,23 @@ function renderProfilo(){
       <button class="btn secondary block" id="p_ws">Cambia o aggiungi spazio</button>
     </div>
     <div class="card">
+      <h3>Notifiche</h3>
+      <p class="hint" style="margin:0 0 12px">Scegli quali modifiche ricevere. Le modifiche fatte da te non generano una notifica sul tuo dispositivo.</p>
+      <label class="checkrow notification-master">
+        <input type="checkbox" data-notification-pref="enabled" ${S.notificationPreferences.enabled?'checked':''}>
+        <span><b>Attiva notifiche</b><small>${esc(notificationPermissionText())}</small></span>
+      </label>
+      <div class="notification-types ${S.notificationPreferences.enabled?'':'muted'}">
+        ${NOTIFICATION_TYPES.map(t=>`
+          <label class="checkrow">
+            <input type="checkbox" data-notification-pref="${t.id}" ${S.notificationPreferences[t.id]?'checked':''} ${S.notificationPreferences.enabled?'':'disabled'}>
+            <span><b>${esc(t.label)}</b><small>${esc(t.description)}</small></span>
+          </label>`).join('')}
+      </div>
+      ${S.notificationPermission!=='granted' ? '<button class="btn secondary block" id="p_notif_permission">Consenti notifiche</button>' : ''}
+      ${S.notificationSetupMissing ? '<p class="hint notification-warning">⚠️ Esegui <b>migration_notifications.sql</b> su Supabase per ricevere le modifiche degli altri utenti.</p>' : ''}
+    </div>
+    <div class="card">
       <h3>Cambia email</h3>
       <p class="hint" style="margin:0 0 10px">Attuale: ${esc(email)}</p>
       <label class="field"><span>Nuova email</span><input type="email" id="p_email"></label>
@@ -1694,6 +1915,11 @@ function renderProfilo(){
     </div>`;
   d.querySelector('#out').onclick = doLogout;
   d.querySelector('#p_ws').onclick = ()=> openModal({type:'my-workspaces'});
+  d.querySelectorAll('[data-notification-pref]').forEach(input=>{
+    input.onchange = ()=> setNotificationPreference(input.dataset.notificationPref, input.checked);
+  });
+  const notifPermission = d.querySelector('#p_notif_permission');
+  if(notifPermission) notifPermission.onclick = enableDeviceNotifications;
   d.querySelector('#p_avatar_go').onclick = ()=> d.querySelector('#p_avatar_file').click();
   d.querySelector('#p_avatar_file').onchange = e=>{
     const file = e.target.files[0];

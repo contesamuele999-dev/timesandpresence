@@ -1,3 +1,10 @@
 .DS_Store
 Thumbs.db
 *.log
+node_modules/
+www/
+.gradle/
+.gradle-local/
+android/.gradle/
+android/local.properties
+/Presencer-debug.apk

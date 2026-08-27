@@ -265,6 +265,14 @@
   label.checkrow{display:flex;align-items:center;gap:10px;margin:2px 0 14px;font-size:14px;
     color:var(--text);cursor:pointer}
   label.checkrow input{width:18px;height:18px;accent-color:var(--brand);flex-shrink:0}
+  label.checkrow span{display:flex;flex-direction:column;gap:2px}
+  label.checkrow small{display:block;color:var(--muted);font-size:12px;line-height:1.35}
+  label.checkrow.notification-master{background:#F6F5F3;border-radius:12px;padding:12px;margin-bottom:12px}
+  .notification-types{border-top:1px solid var(--line);padding-top:12px;transition:opacity .15s}
+  .notification-types.muted{opacity:.5}
+  .notification-types label.checkrow{align-items:flex-start;margin-bottom:12px}
+  .notification-types label.checkrow input{margin-top:2px}
+  .notification-warning{background:#FFF9E6;border-radius:10px;padding:10px 12px;margin-top:12px !important}
 
   .installbar{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:60;
     background:var(--dark);color:#fff;border-radius:14px;padding:10px 12px 10px 16px;display:flex;
@@ -282,9 +290,10 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script src="config.js"></script>
+<script src="native.js"></script>
 <script src="app.js"></script>
 <script>
-  if ('serviceWorker' in navigator) {
+  if ('serviceWorker' in navigator && !(window.PresencerNative && window.PresencerNative.isNative)) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('./sw.js').catch(() => {});
     });

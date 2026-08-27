@@ -4,15 +4,15 @@ Web app semplice per gestire le presenze di istruttori (o dipendenti, o familiar
 organizzati per settimana, con calendari salvabili per periodo (Estate, Inverno, Extra...) e accessi
 "usa e getta" senza registrazione.
 
-Nessuna build: HTML/CSS/JS puri + [Supabase](https://supabase.com) (database + login). Funziona anche
-solo aprendo `index.html` con un piccolo server statico. È anche una **PWA**: si può installare su
-telefono/computer come un'app vera (icona, schermo intero, apre da sola senza barra del browser).
+Il client resta HTML/CSS/JS puro + [Supabase](https://supabase.com) (database + login). Funziona come
+**PWA** e può anche essere compilato in un **APK Android** tramite Capacitor.
 
 ## 1. Crea il progetto Supabase (gratis)
 
 1. Vai su [supabase.com](https://supabase.com) → crea un account → **New project**.
 2. Una volta creato, vai su **SQL Editor** → **New query**, incolla tutto il contenuto di
-   [`schema.sql`](schema.sql) e premi **Run**. Crea tabelle e permessi.
+   [`schema.sql`](schema.sql) e premi **Run**. Crea tabelle e permessi. Esegui poi anche
+   [`migration_notifications.sql`](migration_notifications.sql) per attivare notifiche e preferenze granulari.
 3. Vai su **Authentication → Providers → Email** e **disattiva "Confirm email"**.
    Serve per far funzionare la registrazione al volo, senza dover controllare la posta: pensata
    per chi non è pratico di tecnologia.
@@ -44,7 +44,26 @@ Apri l'indirizzo mostrato (es. `http://localhost:8080`).
 Per hosting reale gratuito basta caricare la cartella su [Netlify](https://netlify.com) (drag&drop) o
 [Vercel](https://vercel.com) — nessuna build necessaria. Oppure usa GitHub Pages, vedi sotto.
 
-## 4. Deploy su GitHub Pages
+## 4. Crea l'APK Android
+
+Requisiti: Node.js 22+, JDK 21, Android Studio e Android SDK 36. Se il JDK non viene rilevato,
+imposta `JAVA_HOME` sulla sua cartella. Poi esegui:
+
+```bash
+npm install
+npm run apk:debug
+```
+
+L'APK di sviluppo viene creato in `android/app/build/outputs/apk/debug/app-debug.apk` e copiato anche
+nella radice come `Presencer-debug.apk`. Per aggiornare il progetto Android senza compilare:
+
+```bash
+npm run android:sync
+```
+
+Il progetto nativo usa l'ID `it.presencer.app`, include l'icona Presencer e supporta Android 7 (API 24) o successivo.
+
+## 5. Deploy su GitHub Pages
 
 La cartella è già un repository git locale (primo commit fatto). Per pubblicarla:
 
@@ -84,6 +103,8 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 5. [`migration_calendar_periods.sql`](migration_calendar_periods.sql) — timeline periodi di validità dei
    calendari: preserva gli orari e le presenze storiche nel passato e attiva automaticamente il nuovo calendario
    a partire dalla data programmata.
+6. [`migration_notifications.sql`](migration_notifications.sql) — eventi in tempo reale, preferenze per utente
+   e categorie di notifica separate.
 
 ## Come funziona
 
@@ -118,6 +139,9 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
   propria voce; tutti i membri dello spazio possono leggere le voci di tutti, ma ognuno modifica solo le
   proprie (l'admin può eliminare qualsiasi voce). Un pallino con il numero sul 📝 indica quante voci ci
   sono già per quella lezione.
+- **Notifiche granulari**: nel Profilo ogni utente può attivare o disattivare separatamente notifiche per
+  presenze, ricorrenze, orari/lezioni, calendari, registri e membri. Le modifiche fatte dallo stesso utente
+  non generano avvisi sul suo dispositivo. Nell'APK ogni categoria corrisponde anche a un canale Android.
 - **Installa come app (PWA)**: quando il browser lo permette (Android/Chrome/Edge) compare in basso un
   pulsante "Installa"; su iPhone/iPad (Safari) il pulsante mostra le istruzioni per "Aggiungi a schermata
   Home". Il pulsante si può chiudere con ✕ e non ricompare più su quel dispositivo.
@@ -130,3 +154,6 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - Rimuovere un istruttore toglie l'accesso allo spazio ma non cancella l'account Supabase sottostante.
 - La "Vista di tutti" per l'amministratore è di sola consultazione (non permette di segnare la presenza
   al posto di un altro istruttore) — coerente con le policy di sicurezza (RLS) del database.
+- Le notifiche di modifica usano Supabase Realtime e vengono mostrate mentre l'app è attiva; quando viene
+  riaperta recupera gli eventi non ancora visti. Per consegna immediata anche ad app completamente chiusa
+  serve aggiungere un provider push remoto (per esempio Firebase Cloud Messaging).

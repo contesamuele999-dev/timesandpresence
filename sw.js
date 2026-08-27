@@ -1,8 +1,9 @@
-const CACHE = 'presencer-v4';
+const CACHE = 'presencer-v5';
 const ASSETS = [
   './',
   './index.html',
   './app.js',
+  './native.js',
   './config.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
@@ -35,5 +36,18 @@ self.addEventListener('fetch', e => {
       caches.open(CACHE).then(c => c.put(e.request, res.clone()));
       return res;
     }).catch(() => caches.match(e.request))
+  );
+});
+
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const target = (e.notification.data && e.notification.data.url) || './';
+  e.waitUntil(
+    clients.matchAll({type:'window', includeUncontrolled:true}).then(list => {
+      for(const client of list){
+        if('focus' in client) return client.focus();
+      }
+      return clients.openWindow ? clients.openWindow(target) : null;
+    })
   );
 });
