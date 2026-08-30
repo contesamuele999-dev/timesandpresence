@@ -1602,7 +1602,7 @@ async function duplicateCalendar(sourceCalId, newName, newPeriod){
 
   closeModal();
   await loadCalendars();
-  await loadSlots();
+  await refreshWeekData();
   toast(`Calendario "${newName}" duplicato con successo (${srcSlots ? srcSlots.length : 0} orari copiati).`);
   openCalendarEditor(newCal);
 }
@@ -1627,13 +1627,13 @@ async function deleteSlot(id, calendarId){
   await loadSlotsForEditor(calendarId);
 }
 async function loadSlotsForEditor(calendarId){
+  const modal = S.modal;
+  if(modal) modal.loadingSlots = true;
   const {data} = await sb.from('slots').select('*').eq('calendar_id', calendarId).order('weekday').order('start_time');
-  S.modal.editSlots = data || [];
-  await loadSlots();
-  const monday = mondayOf(S.weekOffset);
-  await loadExtraForWeek(monday);
-  await loadAttendanceForWeek(monday);
-  render();
+  if(S.modal !== modal) return;   // modale gia' chiuso: non sovrascrivere lo stato corrente
+  if(modal){ modal.editSlots = data || []; modal.loadingSlots = false; }
+  render();                       // gli orari sono in pagina: il resto arriva dopo
+  await refreshWeekData();        // settimana e presenze si aggiornano senza bloccare il modale
 }
 
 /* ---------------- instructors / invite / guest links (admin) ---------------- */
@@ -2311,8 +2311,9 @@ function renderCalendari(){
 }
 
 async function openCalendarEditor(cal){
-  S.modal = {type:'edit-calendar', calendar:cal, editSlots:[]};
+  S.modal = {type:'edit-calendar', calendar:cal, editSlots:[], loadingSlots:true};
   lockScroll();
+  render();                       // apri subito il modale, senza aspettare la rete
   await loadSlotsForEditor(cal.id);
 }
 
@@ -2651,7 +2652,8 @@ function renderModal(){
       row.querySelector('[data-del]').onclick = ()=> deleteSlot(s.id, cal.id);
       list.appendChild(row);
     });
-    if(!(m.editSlots||[]).length) list.innerHTML = `<p class="hint">Nessun orario ancora.</p>`;
+    if(m.loadingSlots) list.innerHTML = `<p class="hint">Caricamento orari…</p>`;
+    else if(!(m.editSlots||[]).length) list.innerHTML = `<p class="hint">Nessun orario ancora.</p>`;
     box.querySelector('#ns_add').onclick = ()=> addSlot(cal.id, {
       weekday: box.querySelector('#ns_day').value,
       start_time: box.querySelector('#ns_start').value,
