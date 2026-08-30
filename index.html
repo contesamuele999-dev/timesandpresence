@@ -54,6 +54,19 @@
   .avatar img{width:100%;height:100%;object-fit:cover}
 
   main{flex:1;padding:16px;max-width:920px;margin:0 auto;width:100%;padding-bottom:96px}
+  /* La vista "Tutti" ha bisogno di larghezza: su schermi grandi togliamo il limite. */
+  main.wide{max-width:1400px}
+  /* Schermo intero: via barra in alto e schede in basso, resta solo la matrice. */
+  .fullscreen-mode > .topbar,.fullscreen-mode > .tabbar,.fullscreen-mode > .installbar{display:none}
+  .fullscreen-mode > main{max-width:none;padding:10px;padding-bottom:10px}
+  /* In orizzontale la testata si mangiava meta' schermo: qui resta solo
+     l'essenziale per muoversi fra le settimane. */
+  .fullscreen-mode main h1,
+  .fullscreen-mode .presence-sync,
+  .fullscreen-mode .matrixhint{display:none}
+  .fullscreen-mode .weeknav{margin-bottom:6px}
+  .fullscreen-mode .day{margin-bottom:10px}
+  .fullscreen-mode .day h3.dayhead{margin-bottom:4px}
 
   nav.tabbar{position:fixed;bottom:0;left:0;right:0;z-index:20;background:#fff;
     border-top:1px solid var(--line);display:flex;padding:6px 4px calc(6px + env(safe-area-inset-bottom));
@@ -180,7 +193,13 @@
     text-align:center;box-shadow:0 0 0 2px #fff}
   /* pulsante "Oggi": distinto dagli altri (accento brand) */
   button#wkToday{background:#FFF1E4;border-color:var(--brand);color:var(--brand);font-weight:800}
-  .mlesson{display:flex;align-items:center;gap:6px}
+  .mlesson{display:flex;flex-direction:column;align-items:flex-start;gap:2px;max-width:150px}
+  .mlesson .mtop{display:flex;align-items:center;gap:6px}
+  .mlesson .mtime{flex-shrink:0}
+  /* Senza questo taglio il nome della lezione dettava la larghezza della prima
+     colonna e mangiava lo spazio delle persone. */
+  .mlesson .mlabel{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    font-weight:600;font-size:11px;color:var(--muted)}
   button.mlogbtn{position:relative;flex-shrink:0;border:1px solid var(--line);border-radius:9px;background:#fff;
     padding:3px 6px;font-size:13px;line-height:1;opacity:.6}
   button.mlogbtn.on{opacity:1;background:#FFF1E4;border-color:var(--brand)}
@@ -200,39 +219,43 @@
   table.matrix tbody tr td:last-child{border-radius:0 10px 10px 0}
   table.matrix td:first-child,table.matrix th:first-child{
     text-align:left;position:sticky;left:0;background:var(--card);z-index:2;
-    min-width:118px;padding-right:12px;font-weight:700;font-size:13px;
+    min-width:104px;padding-right:10px;font-weight:700;font-size:13px;
     box-shadow:3px 0 8px -4px rgba(0,0,0,.15)
   }
-  table.matrix th:not(:first-child),table.matrix td:not(:first-child){min-width:52px}
+  table.matrix th:not(:first-child),table.matrix td:not(:first-child){min-width:36px;padding:6px 3px}
   table.matrix tbody tr:nth-child(odd) td{background:#FBFAF8}
   table.matrix tbody tr:nth-child(odd) td:first-child{background:#FBFAF8}
 
   .mhead-person{display:flex;flex-direction:column;align-items:center;gap:4px}
-  .mavatar{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-    color:#fff;font-weight:800;font-size:12px;flex-shrink:0;overflow:hidden}
+  .mavatar{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    color:#fff;font-weight:800;font-size:11px;flex-shrink:0;overflow:hidden}
   .mavatar img{width:100%;height:100%;object-fit:cover}
   .mavatar.guest{border:2px dashed rgba(255,255,255,.7)}
-  .mname{font-size:10.5px;font-weight:700;color:var(--muted);max-width:56px;overflow:hidden;
+  .mname{font-size:10px;font-weight:700;color:var(--muted);max-width:40px;overflow:hidden;
     text-overflow:ellipsis;white-space:nowrap}
 
-  .mchip{position:relative;display:inline-flex;width:34px;height:34px;border-radius:10px;
+  .mchip{position:relative;display:inline-flex;width:26px;height:26px;border-radius:8px;
     border:2px solid var(--line);background:#fff;transition:transform .1s ease,background .15s,border-color .15s}
   .mchip.on{background:var(--ok);border-color:var(--ok)}
-  .mchip.on::after{content:'';position:absolute;left:11px;top:15px;width:11px;height:6px;
+  .mchip.on::after{content:'';position:absolute;left:8px;top:11px;width:9px;height:5px;
     border-left:2.5px solid #fff;border-bottom:2.5px solid #fff;transform:rotate(-45deg)}
   .mchip.on.rec{background:repeating-linear-gradient(45deg,var(--ok),var(--ok) 4px,#8bd1ab 4px,#8bd1ab 8px)}
   .mchip.off{background:var(--danger);border-color:var(--danger)}
   .mchip.off.rec{background:repeating-linear-gradient(45deg,var(--danger),var(--danger) 4px,#e79a8c 4px,#e79a8c 8px)}
-  .mchip.off::after,.mchip.off::before{content:'';position:absolute;top:15px;left:9px;width:16px;height:2.5px;background:#fff}
+  .mchip.off::after,.mchip.off::before{content:'';position:absolute;top:11px;left:7px;width:12px;height:2.5px;background:#fff}
   .mchip.off::after{transform:rotate(45deg)}
   .mchip.off::before{transform:rotate(-45deg)}
   .mchip:active{transform:scale(.9)}
 
   @media (max-width:480px){
-    table.matrix th:not(:first-child),table.matrix td:not(:first-child){min-width:46px}
-    .mchip{width:30px;height:30px;border-radius:9px}
-    .mchip.on::after{left:9px;top:13px;width:10px;height:5px}
-    table.matrix td:first-child,table.matrix th:first-child{min-width:96px;font-size:12px}
+    table.matrix th:not(:first-child),table.matrix td:not(:first-child){min-width:30px;padding:5px 2px}
+    .mchip{width:24px;height:24px;border-radius:7px}
+    .mchip.on::after{left:7px;top:10px;width:8px;height:4px}
+    .mchip.off::after,.mchip.off::before{top:10px;left:6px;width:11px;height:2px}
+    table.matrix td:first-child,table.matrix th:first-child{min-width:76px;font-size:12px;padding-right:6px}
+    .mlesson{max-width:96px}
+    .mavatar{width:22px;height:22px;font-size:10px}
+    .mname{max-width:32px;font-size:9.5px}
     /* riga lezione più compatta: evita che i pulsanti si sovrappongano al testo */
     .slot{gap:6px;padding:10px}
     .slot .time{width:52px;font-size:12px}

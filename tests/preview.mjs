@@ -41,6 +41,7 @@ const client = mockClient(async request => {
 client.auth = {
   onAuthStateChange() {},
   getSession: async () => ({ data: { session: { user: { id: 'user-test', email: 'test@example.invalid' } } } }),
+  refreshSession: async () => ({ data: { session: { user: { id: 'user-test', email: 'test@example.invalid' } } }, error: null }),
 };
 client.channel = () => ({
   on(_type, _options, listener) { eventListener = listener; return this; },

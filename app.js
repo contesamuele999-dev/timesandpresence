@@ -56,6 +56,7 @@ const S = {
   recurring: [],
   lessonLogs: [],       // registro lezione: cosa è stato fatto in ogni lezione/data
   showAllMatrix: false,
+  matrixFullscreen: false,  // vista Tutti a tutta pagina, senza barre
   presenceSaving: false,
   weekLoading: false,
   weekLoadFailed: false,
@@ -66,6 +67,7 @@ const S = {
 
   instructors: [],
   guestLinks: [],
+  backupBusy: false,   // esportazione o ripristino in corso
 
   notificationPreferences: Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES),
   notificationPermission: 'prompt', // prompt | granted | denied | unavailable
@@ -1775,6 +1777,230 @@ async function revokeGuestLink(id){
 
 /* ---------------- modal helpers ---------------- */
 let savedScrollY = 0;
+/* ---------------- backup dello spazio ----------------
+   Salva su file tutto cio' che appartiene allo spazio: calendari, orari, lezioni
+   extra, presenze, ricorrenze, registri e accessi rapidi. Le persone NON sono
+   ricreabili (sono legate agli account di accesso), quindi finiscono nel file solo
+   come riferimento e in fase di ripristino le presenze vengono riagganciate ai
+   membri attuali: stesso id, oppure stesso nome. */
+const BACKUP_FORMAT = 'presencer-backup';
+
+async function softRows(query){
+  // Alcune tabelle esistono solo se la migrazione e' stata eseguita: la loro
+  // assenza non deve far fallire l'intero backup.
+  try{ return await checkedRows(query); }
+  catch(error){
+    if(error && (error.code==='42P01' || error.code==='PGRST205')) return [];
+    throw error;
+  }
+}
+
+async function buildBackup(){
+  const wsId = S.workspace.id;
+  const calendars = await checkedRows(sb.from('calendars').select('*').eq('workspace_id', wsId).order('created_at'));
+  const calIds = calendars.map(c=>c.id);
+  const profiles = await checkedRows(sb.from('profiles').select('*').eq('workspace_id', wsId));
+  const calendarPeriods = await softRows(sb.from('calendar_periods').select('*').eq('workspace_id', wsId));
+  const guestLinks = await softRows(sb.from('guest_links').select('*').eq('workspace_id', wsId));
+  const slots = calIds.length ? await checkedRows(sb.from('slots').select('*').in('calendar_id', calIds)) : [];
+  const extraSlots = calIds.length ? await checkedRows(sb.from('extra_slots').select('*').in('calendar_id', calIds)) : [];
+  const slotIds = slots.map(s=>s.id), extraIds = extraSlots.map(s=>s.id);
+  const bySlot = (table, column, ids)=> ids.length ? softRows(sb.from(table).select('*').in(column, ids)) : [];
+  const attendance = (await bySlot('attendance','slot_id',slotIds)).concat(await bySlot('attendance','extra_slot_id',extraIds));
+  const recurring = await bySlot('recurring_presence','slot_id',slotIds);
+  const lessonLogs = (await bySlot('lesson_logs','slot_id',slotIds)).concat(await bySlot('lesson_logs','extra_slot_id',extraIds));
+  return {
+    format: BACKUP_FORMAT,
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    workspace: {
+      id: wsId, name: S.workspace.name,
+      active_calendar_id: S.workspace.active_calendar_id || null,
+      scheduled_calendar_id: S.workspace.scheduled_calendar_id || null,
+      scheduled_calendar_date: S.workspace.scheduled_calendar_date || null,
+    },
+    profiles, calendars, calendarPeriods, slots, extraSlots, guestLinks, attendance, recurring, lessonLogs,
+  };
+}
+
+function backupCounts(b){
+  return [
+    ['Calendari', (b.calendars||[]).length],
+    ['Orari settimanali', (b.slots||[]).length],
+    ['Lezioni extra', (b.extraSlots||[]).length],
+    ['Presenze', (b.attendance||[]).length],
+    ['Presenze ricorrenti', (b.recurring||[]).length],
+    ['Registri lezione', (b.lessonLogs||[]).length],
+    ['Accessi rapidi', (b.guestLinks||[]).length],
+    ['Membri (solo riferimento)', (b.profiles||[]).length],
+  ];
+}
+
+function backupCountsHtml(counts){
+  return '<div class="col" style="gap:4px;margin:12px 0">' + counts
+    .map(([k,v])=> '<div class="row between"><span class="hint">'+esc(k)+'</span><b>'+v+'</b></div>')
+    .join('') + '</div>';
+}
+
+function downloadText(filename, text){
+  try{
+    const url = URL.createObjectURL(new Blob([text], {type:'application/json'}));
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=> URL.revokeObjectURL(url), 5000);
+    return true;
+  }catch(e){ return false; }
+}
+
+async function exportBackup(){
+  if(S.backupBusy || !S.workspace) return;
+  S.backupBusy = true; S.dataError = null; render();
+  try{
+    const backup = await buildBackup();
+    const text = JSON.stringify(backup, null, 2);
+    const slug = (S.workspace.name||'spazio').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'') || 'spazio';
+    const name = 'presencer-' + slug + '-' + todayISO() + '.json';
+    downloadText(name, text);
+    S.modal = {type:'backup-done', name, text, counts: backupCounts(backup)};
+    lockScroll();
+  }catch(error){
+    showDataError(error, 'Esportazione backup');
+  }finally{
+    S.backupBusy = false; render();
+  }
+}
+
+function pickBackupFile(){
+  if(S.backupBusy) return;
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json,.json';
+  input.onchange = async ()=>{
+    const file = input.files && input.files[0];
+    if(!file) return;
+    let backup;
+    try{ backup = JSON.parse(await file.text()); }
+    catch(e){ toast('File non leggibile: non e\u2019 un JSON valido.'); return; }
+    if(!backup || backup.format!==BACKUP_FORMAT){ toast('Questo file non e\u2019 un backup di Presencer.'); return; }
+    openModal({type:'backup-restore', backup, counts: backupCounts(backup)});
+  };
+  input.click();
+}
+
+async function restoreBackup(backup){
+  if(S.backupBusy || !S.workspace) return;
+  const wsId = S.workspace.id;
+  S.backupBusy = true; S.dataError = null; render();
+  let skipped = 0;
+  try{
+    // Le persone restano quelle di adesso: dal backup recuperiamo solo il legame.
+    const current = new Set(S.instructors.map(p=>p.id));
+    const byName = new Map(S.instructors.map(p=>[(p.name||'').trim().toLowerCase(), p.id]));
+    const oldProfiles = new Map((backup.profiles||[]).map(p=>[p.id, p]));
+    const mapProfile = id=>{
+      if(!id) return null;
+      if(current.has(id)) return id;
+      const old = oldProfiles.get(id);
+      return (old && byName.get((old.name||'').trim().toLowerCase())) || null;
+    };
+    const insertAll = async (table, rows)=>{
+      for(let i=0; i<rows.length; i+=400){
+        const {error} = await sb.from(table).insert(rows.slice(i, i+400));
+        if(error) throw error;
+      }
+    };
+
+    // Cancellare i calendari porta via a cascata orari, lezioni extra, presenze,
+    // ricorrenze e registri: non serve svuotarli uno per uno.
+    let del = await sb.from('calendars').delete().eq('workspace_id', wsId);
+    if(del.error) throw del.error;
+    del = await sb.from('guest_links').delete().eq('workspace_id', wsId);
+    if(del.error && del.error.code!=='42P01' && del.error.code!=='PGRST205') throw del.error;
+
+    const calendars = (backup.calendars||[]).map(c=>({id:c.id, workspace_id:wsId, name:c.name, period:c.period}));
+    await insertAll('calendars', calendars);
+    const calIds = new Set(calendars.map(c=>c.id));
+
+    await insertAll('calendar_periods', (backup.calendarPeriods||[])
+      .filter(p=> calIds.has(p.calendar_id))
+      .map(p=>({id:p.id, workspace_id:wsId, calendar_id:p.calendar_id, start_date:p.start_date})));
+
+    const slots = (backup.slots||[]).filter(s=> calIds.has(s.calendar_id))
+      .map(s=>({id:s.id, calendar_id:s.calendar_id, weekday:s.weekday, start_time:s.start_time, end_time:s.end_time, label:s.label}));
+    await insertAll('slots', slots);
+    const slotIds = new Set(slots.map(s=>s.id));
+
+    const extras = (backup.extraSlots||[]).filter(e=> calIds.has(e.calendar_id))
+      .map(e=>({id:e.id, calendar_id:e.calendar_id, date:e.date, start_time:e.start_time, end_time:e.end_time, label:e.label, created_by:mapProfile(e.created_by)}));
+    await insertAll('extra_slots', extras);
+    const extraIds = new Set(extras.map(e=>e.id));
+
+    const links = (backup.guestLinks||[]).map(g=>({id:g.id, workspace_id:wsId, token:g.token, label:g.label, expires_at:g.expires_at, created_by:mapProfile(g.created_by)}));
+    await insertAll('guest_links', links);
+    const tokens = new Set(links.map(g=>g.token));
+
+    const refOk = r=> r.slot_id ? slotIds.has(r.slot_id) : extraIds.has(r.extra_slot_id);
+    const seen = new Set();
+    const unique = key=>{ if(seen.has(key)) return false; seen.add(key); return true; };
+
+    const attendance = [];
+    (backup.attendance||[]).forEach(a=>{
+      if(!refOk(a)){ skipped++; return; }
+      const who = a.guest_token ? (tokens.has(a.guest_token) ? a.guest_token : null) : mapProfile(a.instructor_id);
+      if(!who){ skipped++; return; }
+      if(!unique(['a', a.slot_id||'', a.extra_slot_id||'', who, a.date].join('|'))){ skipped++; return; }
+      const row = {id:a.id, slot_id:a.slot_id||null, extra_slot_id:a.extra_slot_id||null, date:a.date, status:a.status, note:a.note||null};
+      if(a.guest_token){ row.guest_token = who; row.guest_name = a.guest_name||null; }
+      else row.instructor_id = who;
+      attendance.push(row);
+    });
+    await insertAll('attendance', attendance);
+
+    const recurring = [];
+    (backup.recurring||[]).forEach(r=>{
+      if(!slotIds.has(r.slot_id)){ skipped++; return; }
+      const who = mapProfile(r.instructor_id);
+      if(!who){ skipped++; return; }
+      if(!unique(['r', r.slot_id, who].join('|'))){ skipped++; return; }
+      recurring.push({id:r.id, slot_id:r.slot_id, instructor_id:who, status:r.status});
+    });
+    await insertAll('recurring_presence', recurring);
+
+    const logs = [];
+    (backup.lessonLogs||[]).forEach(l=>{
+      if(!refOk(l)){ skipped++; return; }
+      const who = mapProfile(l.instructor_id);
+      if(!who){ skipped++; return; }
+      if(!unique(['l', l.slot_id||'', l.extra_slot_id||'', who, l.date].join('|'))){ skipped++; return; }
+      logs.push({id:l.id, slot_id:l.slot_id||null, extra_slot_id:l.extra_slot_id||null, instructor_id:who, date:l.date, content:l.content});
+    });
+    if(logs.length) await insertAll('lesson_logs', logs);
+
+    // Nome e codice invito dello spazio restano quelli attuali: si ripristina il
+    // contenuto, non l'identita' dello spazio.
+    const w = backup.workspace || {};
+    const upd = await sb.from('workspaces').update({
+      active_calendar_id: calIds.has(w.active_calendar_id) ? w.active_calendar_id : null,
+      scheduled_calendar_id: calIds.has(w.scheduled_calendar_id) ? w.scheduled_calendar_id : null,
+      scheduled_calendar_date: calIds.has(w.scheduled_calendar_id) ? (w.scheduled_calendar_date||null) : null,
+    }).eq('id', wsId).select().maybeSingle();
+    if(upd.error) throw upd.error;
+    if(upd.data) S.workspace = upd.data;
+
+    closeModal();
+    await loadCalendars();
+    await refreshWeekData();
+    await loadGuestLinks();
+    toast(skipped ? 'Backup ripristinato. ' + skipped + ' righe saltate.' : 'Backup ripristinato.');
+  }catch(error){
+    showDataError(error, 'Ripristino backup');
+    toast('Ripristino interrotto. Controlla il messaggio in cima alla pagina.');
+  }finally{
+    S.backupBusy = false; render();
+  }
+}
+
 function lockScroll(){
   if(document.body.classList.contains('modal-open')) return; // già bloccato
   savedScrollY = window.scrollY || window.pageYOffset || 0;
@@ -2045,6 +2271,8 @@ function renderDataError(){
 
 function renderShell(){
   const wrap = document.createElement('div');
+  const allView = S.tab==='presenze' && S.showAllMatrix;
+  if(allView && S.matrixFullscreen) wrap.className = 'fullscreen-mode';
 
   // topbar
   const top = document.createElement('header');
@@ -2065,6 +2293,7 @@ function renderShell(){
 
   // main
   const main = document.createElement('main');
+  if(allView) main.className = 'wide';
   if(S.dataError) main.appendChild(renderDataError());
   if(S.tab==='presenze') main.appendChild(renderPresenze());
   if(S.tab==='calendari') main.appendChild(renderCalendari());
@@ -2082,6 +2311,7 @@ function renderShell(){
   nav.innerHTML = tabs.map(([id,ic,lb])=>`<button data-tab="${id}" class="${S.tab===id?'active':''}"><span class="ic">${ic}</span>${lb}</button>`).join('');
   nav.querySelectorAll('button').forEach(b=> b.onclick = ()=>{
     S.tab=b.dataset.tab;
+    S.matrixFullscreen = false;
     if(S.tab==='istruttori'){ loadInstructors(); loadGuestLinks(); }
     render();
   });
@@ -2133,6 +2363,7 @@ function renderPresenze(){
           <button data-v="mine" class="${!S.showAllMatrix?'on':''}">Personale</button>
           <button data-v="all" class="${S.showAllMatrix?'on':''}">Tutti</button>
         </div>
+        ${S.showAllMatrix ? `<button class="btn secondary sm" id="fsBtn">${S.matrixFullscreen?'✕ Esci da schermo intero':'⤢ Schermo intero'}</button>` : ''}
       </div>
       ${S.showAllMatrix ? '<p class="hint">La vista Tutti è di sola consultazione. Per modificare le tue presenze scegli Personale.</p>' : ''}
       <div id="daysHost"></div>
@@ -2159,10 +2390,13 @@ function renderPresenze(){
     S.weekOffset=0; await refreshWeekData();
   };
   d.querySelector('#addExtraBtn').onclick = ()=> openModal({type:'add-extra', date: todayISO()});
+  const fsBtn = d.querySelector('#fsBtn');
+  if(fsBtn) fsBtn.onclick = ()=>{ S.matrixFullscreen = !S.matrixFullscreen; render(); };
   d.querySelectorAll('#viewSeg button').forEach(b=> b.onclick = async ()=>{
     const wantAll = b.dataset.v==='all';
     if(wantAll===S.showAllMatrix) return;
     S.showAllMatrix = wantAll;
+    if(!wantAll) S.matrixFullscreen = false;
     if(S.showAllMatrix && S.instructors.length===0) await loadInstructors();
     render();
   });
@@ -2183,6 +2417,7 @@ function renderPresenze(){
   else if(S.navDir==='prev') host.classList.add('wk-in-left');
   S.navDir = null;
   attachSwipeWeekNav(host);
+  if(S.showAllMatrix) syncMatrixScroll(host);
   return d;
 }
 
@@ -2216,6 +2451,22 @@ function attachSwipeWeekNav(el){
     S.navDir = forward ? 'next' : 'prev';
     refreshWeekData();
   }, {passive:true});
+}
+
+/* Ogni giorno ha la sua tabella scorrevole. Se scorrono separatamente, appena
+   sposti un giorno le colonne non sono piu' allineate con gli altri e la visione
+   d'insieme si perde: qui le muoviamo tutte insieme. */
+function syncMatrixScroll(host){
+  const wraps = Array.from(host.querySelectorAll('.matrixwrap'));
+  if(wraps.length < 2) return;
+  let syncing = false;
+  wraps.forEach(w=> w.addEventListener('scroll', ()=>{
+    if(syncing) return;
+    syncing = true;
+    const x = w.scrollLeft;
+    wraps.forEach(other=>{ if(other!==w && other.scrollLeft!==x) other.scrollLeft = x; });
+    requestAnimationFrame(()=>{ syncing = false; });
+  }, {passive:true}));
 }
 
 function slotsForDate(dt){
@@ -2305,7 +2556,7 @@ function renderDayMatrix(dt){
     const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
     const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
     const logBtn = canLog ? `<button class="mlogbtn ${iHaveLog?'on':''}" data-li="${idx}" title="Registro lezione">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : '';
-    html += `<tr><td><div class="mlesson">${fmtHM(it.start)} ${esc(it.label)}${logBtn}</div></td>`;
+    html += `<tr><td><div class="mlesson"><span class="mtop"><span class="mtime">${fmtHM(it.start)}</span>${logBtn}</span><span class="mlabel" title="${esc(it.label)}">${esc(it.label)}</span></div></td>`;
     cols.forEach(c=>{
       const row = S.attendance.find(a=>{
         const sameSlot = it.ref.slot_id ? a.slot_id===it.ref.slot_id : a.extra_slot_id===it.ref.extra_slot_id;
@@ -2487,6 +2738,20 @@ function renderIstruttori(){
     });
   }
   d.appendChild(guestCard);
+
+  const backupCard = document.createElement('div');
+  backupCard.className = 'card';
+  backupCard.innerHTML = `
+    <h3>Backup</h3>
+    <p class="hint">Salva su file calendari, orari, lezioni extra, presenze, ricorrenze, registri e accessi rapidi di questo spazio. Utile prima di una modifica grossa.</p>
+    <div class="row">
+      <button class="btn secondary sm" id="bkExport" ${S.backupBusy?'disabled':''}>${S.backupBusy?'Attendi…':'⬇ Esporta backup'}</button>
+      <button class="btn secondary sm" id="bkImport" ${S.backupBusy?'disabled':''}>⬆ Importa backup</button>
+    </div>
+    <p class="hint">Le persone e i loro account non si possono salvare in un file: restano quelle di adesso. Al ripristino le presenze vengono riagganciate ai membri con lo stesso nome; quelle di chi non c\u2019e\u2019 piu\u2019 vengono saltate e te lo diciamo.</p>`;
+  backupCard.querySelector('#bkExport').onclick = exportBackup;
+  backupCard.querySelector('#bkImport').onclick = pickBackupFile;
+  d.appendChild(backupCard);
 
   const dangerCard = document.createElement('div');
   dangerCard.className = 'card';
@@ -2755,6 +3020,35 @@ function renderModal(){
       end_time: box.querySelector('#ns_end').value,
       label: box.querySelector('#ns_label').value,
     });
+  }
+
+  else if(m.type==='backup-done'){
+    box.innerHTML = `
+      <div class="mhead"><h2>Backup pronto ✅</h2><button id="x">✕</button></div>
+      <p class="hint">File: <b>${esc(m.name)}</b></p>
+      ${backupCountsHtml(m.counts)}
+      <p class="hint">Se il download non e\u2019 partito da solo (succede dentro l\u2019app Android), copia il testo qui sotto e incollalo in un file con estensione .json.</p>
+      <button class="btn block" id="bk_copy">Copia negli appunti</button>`;
+    box.querySelector('#bk_copy').onclick = async ()=>{
+      try{ await navigator.clipboard.writeText(m.text); toast('Backup copiato negli appunti.'); }
+      catch(e){ toast('Copia non riuscita.'); }
+    };
+  }
+
+  else if(m.type==='backup-restore'){
+    const quando = m.backup.exportedAt ? new Date(m.backup.exportedAt).toLocaleString('it-IT') : 'data sconosciuta';
+    const daSpazio = m.backup.workspace && m.backup.workspace.name ? ' · spazio “'+esc(m.backup.workspace.name)+'”' : '';
+    box.innerHTML = `
+      <div class="mhead"><h2>Importa backup</h2><button id="x">✕</button></div>
+      <p class="hint">Del ${quando}${daSpazio}</p>
+      ${backupCountsHtml(m.counts)}
+      <p class="hint" style="background:#FFF1E4;padding:10px;border-radius:8px;line-height:1.4">⚠️ Calendari, orari, lezioni extra, presenze, ricorrenze e registri di <b>${esc(S.workspace.name)}</b> vengono <b>cancellati</b> e sostituiti con quelli del file. Non si puo\u2019 annullare: se hai dubbi, esporta prima un backup di adesso.</p>
+      <label class="field"><span>Scrivi il nome dello spazio per confermare</span><input type="text" id="bk_confirm" placeholder="${esc(S.workspace.name)}"></label>
+      <button class="btn danger block" id="bk_go" ${S.backupBusy?'disabled':''}>${S.backupBusy?'Ripristino in corso…':'Sostituisci tutto'}</button>`;
+    box.querySelector('#bk_go').onclick = ()=>{
+      if(box.querySelector('#bk_confirm').value.trim() !== S.workspace.name) return toast('Nome non corrispondente: non ho toccato niente.');
+      restoreBackup(m.backup);
+    };
   }
 
   else if(m.type==='new-guestlink'){
