@@ -1,0 +1,41 @@
+<!--
+  Icona per le notifiche in barra di stato.
+  Android accetta solo una sagoma monocromatica su sfondo trasparente: la colora
+  lui (vedi "iconColor" in capacitor.config.json). Un PNG a colori diventerebbe
+  un quadrato bianco, per questo non si può usare l'icona dell'app così com'è.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- ganci del portablocco -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M9,2.2 h1.6 a0.8,0.8 0 0 1 0.8,0.8 v2.4 a0.8,0.8 0 0 1 -0.8,0.8 h-1.6 a0.8,0.8 0 0 1 -0.8,-0.8 v-2.4 a0.8,0.8 0 0 1 0.8,-0.8 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M13.4,2.2 h1.6 a0.8,0.8 0 0 1 0.8,0.8 v2.4 a0.8,0.8 0 0 1 -0.8,0.8 h-1.6 a0.8,0.8 0 0 1 -0.8,-0.8 v-2.4 a0.8,0.8 0 0 1 0.8,-0.8 z" />
+
+    <!-- corpo del calendario -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:pathData="M6.2,4.6 h11.6 a2.2,2.2 0 0 1 2.2,2.2 v12.4 a2.2,2.2 0 0 1 -2.2,2.2 h-11.6 a2.2,2.2 0 0 1 -2.2,-2.2 v-12.4 a2.2,2.2 0 0 1 2.2,-2.2 z" />
+
+    <!-- fascia superiore -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6.2,4.6 h11.6 a2.2,2.2 0 0 1 2.2,2.2 v1.6 h-16 v-1.6 a2.2,2.2 0 0 1 2.2,-2.2 z" />
+
+    <!-- spunta di presenza -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.1"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M8,14.2 l2.7,2.7 l5,-5.6" />
+</vector>

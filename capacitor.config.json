@@ -5,6 +5,7 @@
   "backgroundColor": "#F6F5F3",
   "plugins": {
     "LocalNotifications": {
+      "smallIcon": "ic_stat_presencer",
       "iconColor": "#E86B00"
     }
   }

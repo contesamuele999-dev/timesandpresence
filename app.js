@@ -28,9 +28,10 @@ const DEFAULT_NOTIFICATION_PREFERENCES = {
 
 let sb = null;
 const S = {
-  view: 'loading',      // loading | setup | auth | guestname | app
+  view: 'loading',      // loading | setup | auth | guestname | reconnect | no-workspace | app
   authTab: 'login',     // login | register | join
   authErr: '',
+  reconnectMsg: '',     // testo della schermata "sei collegato ma manca la rete"
   busy: false,
 
   session: null,
@@ -395,11 +396,34 @@ async function startNotificationListener(){
 }
 
 document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState==='visible' && S.view==='app' && !isGuest()){
+  if(document.visibilityState!=='visible') return;
+  if(S.view==='app' && !isGuest()){
+    // Mentre l'app era in secondo piano Android sospende la WebView e il rinnovo
+    // automatico del token si ferma: al ritorno lo rinnoviamo noi, altrimenti la
+    // prima richiesta fallisce con 401 e sembra un logout improvviso.
+    refreshSessionIfStale();
     loadInstructors();
     catchUpNotificationEvents();
   }
+  if(S.view==='reconnect') retryAfterReconnect();
 });
+
+// Tornata la linea, riprova da solo: sull'APK capita spesso di aprire l'app
+// prima che WiFi o dati siano pronti.
+window.addEventListener('online', ()=>{
+  if(S.view==='reconnect') retryAfterReconnect();
+});
+
+/* Rinnova il token se sta per scadere (o è già scaduto) */
+async function refreshSessionIfStale(){
+  if(!sb || !S.session || isGuest()) return;
+  const expires = S.session.expires_at ? S.session.expires_at*1000 : 0;
+  if(expires && expires - Date.now() > 120000) return;   // ancora buono per 2 minuti
+  try{
+    const {data, error} = await sb.auth.refreshSession();
+    if(!error && data && data.session) S.session = data.session;
+  }catch(e){ console.error(e); }
+}
 
 function dataErrorMessage(error){
   const code = error?.code || '';
@@ -662,6 +686,25 @@ function clearAuthWatchdog(){
   if(authWatchdog){ clearTimeout(authWatchdog); authWatchdog = null; }
 }
 
+/* Errore passeggero (rete assente, WiFi che cambia, server lento): riprovare ha senso */
+function isTransientError(err){
+  if(!err) return false;
+  if(navigator.onLine===false) return true;
+  const msg = ((err.message||'') + ' ' + (err.details||'')).toLowerCase();
+  if(/failed to fetch|networkerror|network request failed|load failed|timeout|aborted|econn/.test(msg)) return true;
+  const status = err.status || err.statusCode;
+  return status===0 || status===408 || status===429 || (status>=500 && status<=599);
+}
+
+/* Il token non è più valido: qui sì che serve rifare l'accesso */
+function isAuthExpiredError(err){
+  if(!err) return false;
+  const code = err.code || '';
+  const msg = (err.message||'').toLowerCase();
+  return err.status===401 || ['PGRST301','PGRST302','PGRST303'].includes(code)
+    || msg.includes('jwt expired') || msg.includes('invalid claim') || msg.includes('refresh token');
+}
+
 async function handleSignedIn(){
   if(signInBusy) return;
   signInBusy = true;
@@ -680,7 +723,33 @@ async function handleSignedIn(){
   }catch(err){
     console.error(err);
     clearAuthWatchdog();
-    S.busy=false; S.view='auth';
+    S.busy=false;
+
+    // Un intoppo di rete NON deve buttare fuori chi ha fatto l'accesso: la
+    // sessione resta valida, mostriamo una schermata di riconnessione.
+    if(isTransientError(err)){
+      S.reconnectMsg = navigator.onLine===false
+        ? 'Sei senza connessione. Appena torni online riprovo da solo.'
+        : 'Non riesco a contattare il server. Controlla la connessione.';
+      S.view='reconnect'; render(); return;
+    }
+
+    // Token scaduto: proviamo a rinnovarlo prima di chiedere di riaccedere.
+    if(isAuthExpiredError(err)){
+      try{
+        const {data, error} = await sb.auth.refreshSession();
+        if(!error && data && data.session){
+          S.session = data.session;
+          signInBusy = false;
+          return handleSignedIn();
+        }
+      }catch(e){ console.error(e); }
+      S.view='auth';
+      S.authErr = 'La sessione è scaduta: accedi di nuovo.';
+      render(); return;
+    }
+
+    S.view='auth';
     S.authErr = authErrorMessage(err, 'Errore di caricamento. Riprova.');
     render();
   }finally{
@@ -688,14 +757,29 @@ async function handleSignedIn(){
   }
 }
 
+/* Ritenta le letture fallite per motivi passeggeri: all'avvio dell'APK la rete
+   spesso non è ancora pronta e un singolo tentativo fallisce senza motivo. */
+async function withRetry(run, attempts=3){
+  let last;
+  for(let i=0; i<attempts; i++){
+    try{
+      const {data, error} = await run();
+      if(!error) return data;
+      last = error;
+    }catch(err){ last = err; }
+    if(!isTransientError(last)) throw last;
+    if(i < attempts-1) await new Promise(r=> setTimeout(r, 600*(i+1)));
+  }
+  throw last;
+}
+
 async function loadMyProfiles(){
   const uid = S.session.user.id;
-  const {data:profs, error} = await sb.from('profiles').select('*').eq('user_id', uid).order('created_at');
-  if(error) throw error;
+  const profs = await withRetry(()=> sb.from('profiles').select('*').eq('user_id', uid).order('created_at'));
   S.myProfiles = profs || [];
   if(S.myProfiles.length){
     const ids = S.myProfiles.map(p=>p.workspace_id);
-    const {data:wss} = await sb.from('workspaces').select('id,name').in('id', ids);
+    const wss = await withRetry(()=> sb.from('workspaces').select('id,name').in('id', ids));
     S.myWorkspaces = wss || [];
   } else {
     S.myWorkspaces = [];
@@ -704,15 +788,22 @@ async function loadMyProfiles(){
 
 async function activateProfile(prof, reason){
   S.profile = prof;
-  const {data:ws, error} = await sb.from('workspaces').select('*').eq('id', prof.workspace_id).maybeSingle();
-  if(error || !ws){
+  let ws = null, wsErr = null;
+  try{
+    ws = await withRetry(()=> sb.from('workspaces').select('*').eq('id', prof.workspace_id).maybeSingle());
+  }catch(err){ wsErr = err; }
+  if(wsErr || !ws){
     // Senza spazio non c'è nulla da mostrare: non lasciamo l'accesso appeso.
-    console.error(error);
-    if(S.view!=='app'){
-      authFail(authErrorMessage(error, 'Non riesco a caricare il tuo spazio. Controlla la connessione e riprova.'));
-    } else {
-      toast('Errore caricamento spazio.');
+    console.error(wsErr);
+    if(S.view==='app'){ toast('Errore caricamento spazio.'); return; }
+    clearAuthWatchdog();
+    S.busy = false;
+    if(isTransientError(wsErr)){
+      // Problema di rete: la sessione resta valida, niente logout a sorpresa.
+      S.reconnectMsg = 'Non riesco a caricare il tuo spazio. Controlla la connessione.';
+      S.view='reconnect'; render(); return;
     }
+    authFail(authErrorMessage(wsErr, 'Non riesco a caricare il tuo spazio. Riprova.'));
     return;
   }
   S.workspace = ws;
@@ -1606,8 +1697,35 @@ function render(){
   if(S.view==='setup'){ APP.appendChild(renderSetup()); return; }
   if(S.view==='guestname'){ APP.appendChild(renderGuestName()); return; }
   if(S.view==='auth'){ APP.appendChild(renderAuth()); return; }
+  if(S.view==='reconnect'){ APP.appendChild(renderReconnect()); return; }
   if(S.view==='no-workspace'){ APP.appendChild(renderNoWorkspace()); return; }
   if(S.view==='app'){ APP.appendChild(renderShell()); return; }
+}
+
+/* Sei ancora dentro: è solo la rete che manca. Nessun logout, solo un "riprova". */
+function renderReconnect(){
+  const d = document.createElement('div');
+  d.className = 'authwrap';
+  d.innerHTML = `
+    <div class="authbox">
+      <div class="logo"><div class="mark">📋</div><h1>Presencer</h1><p>Sei ancora collegato al tuo account.</p></div>
+      <div class="card">
+        <p style="margin:0 0 14px">${esc(S.reconnectMsg || 'Non riesco a contattare il server.')}</p>
+        <button class="btn block" id="rc_retry" ${S.busy?'disabled':''}>${S.busy?'Riprovo...':'Riprova'}</button>
+        <button class="btn ghost block" id="rc_out" style="margin-top:8px">Esci dall'account</button>
+      </div>
+    </div>`;
+  d.querySelector('#rc_retry').onclick = retryAfterReconnect;
+  d.querySelector('#rc_out').onclick = doLogout;
+  return d;
+}
+
+async function retryAfterReconnect(){
+  if(S.busy || signInBusy) return;
+  if(!S.session){ S.view='auth'; render(); return; }
+  S.busy = true; render();
+  await handleSignedIn();
+  if(S.view==='reconnect'){ S.busy = false; render(); }
 }
 
 function renderNoWorkspace(){

@@ -60,6 +60,10 @@ window.PresencerNative = {
         title:event.title || 'Presencer',
         body:event.body || 'Un evento è stato modificato.',
         channelId:channelId(event.category),
+        // Sagoma monocromatica in barra di stato + icona a colori dell'app
+        // nel pannello notifiche (Android non accetta un'icona piccola a colori).
+        smallIcon:'ic_stat_presencer',
+        largeIcon:'presencer_icon',
         extra:{eventId:String(event.id), category:event.category},
       }],
     });
