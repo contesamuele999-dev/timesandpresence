@@ -8,3 +8,7 @@ www/
 android/.gradle/
 android/local.properties
 /Presencer-debug.apk
+
+# Firebase: identificativi del progetto, non vanno nel repository
+android/app/google-services.json
+.env.push

@@ -68,6 +68,8 @@ const S = {
 
   notificationPreferences: Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES),
   notificationPermission: 'prompt', // prompt | granted | denied | unavailable
+  pushToken: null,      // recapito Firebase di questo telefono
+  pushActive: false,    // true = le notifiche arrivano dal server, anche ad app chiusa
   notificationSetupMissing: false,
 
   modal: null,          // {type, ...data}
@@ -273,6 +275,53 @@ async function loadNotificationPreferences(){
     }
   }catch(e){}
 }
+/* ---------------- notifiche push (server → telefono, anche ad app chiusa) ----------------
+   Il token è il "recapito" del telefono: lo salviamo accanto al profilo così la
+   Edge Function sa dove spedire. Se le push non sono disponibili non succede
+   nulla: restano le notifiche locali di quando l'app è aperta. */
+async function syncPushToken(){
+  const native = nativeNotifications();
+  if(!native || !native.registerPush || !S.profile || !S.session) return;
+  if(!S.notificationPreferences.enabled) return;
+  try{
+    const token = await native.registerPush();
+    if(!token){ S.pushActive = false; return; }
+    const {error} = await sb.from('device_tokens').upsert({
+      profile_id: S.profile.id,
+      user_id: S.session.user.id,
+      token,
+      platform: 'android',
+      updated_at: new Date().toISOString(),
+    }, {onConflict:'profile_id,token'});
+    if(error){
+      // Migrazione non ancora eseguita: nessun danno, solo niente push.
+      if(error.code!=='42P01' && error.code!=='PGRST205') console.error(error);
+      S.pushActive = false;
+      return;
+    }
+    S.pushToken = token;
+    S.pushActive = true;
+  }catch(err){
+    console.warn('Push non attivate', err);
+    S.pushActive = false;
+  }
+}
+
+/* All'uscita togliamo il recapito, altrimenti il telefono continuerebbe a
+   ricevere le notifiche di uno spazio a cui non appartiene più. */
+async function removePushToken(){
+  const native = nativeNotifications();
+  try{
+    if(S.pushToken && S.profile){
+      await sb.from('device_tokens').delete()
+        .eq('profile_id', S.profile.id).eq('token', S.pushToken);
+    }
+    if(native && native.unregisterPush) await native.unregisterPush();
+  }catch(err){ console.warn(err); }
+  S.pushToken = null;
+  S.pushActive = false;
+}
+
 async function saveNotificationPreferences(){
   persistLocalNotificationPreferences();
   if(!S.profile) return;
@@ -294,7 +343,8 @@ async function enableDeviceNotifications(){
     if(permission==='granted'){
       S.notificationPreferences.enabled = true;
       await saveNotificationPreferences();
-      toast('Notifiche attivate.');
+      await syncPushToken();
+      toast(S.pushActive ? 'Notifiche attivate, anche ad app chiusa.' : 'Notifiche attivate.');
     } else {
       S.notificationPreferences.enabled = false;
       await saveNotificationPreferences();
@@ -320,10 +370,16 @@ function notificationPermissionText(){
   if(S.notificationPermission==='unavailable') return 'Non disponibili su questo dispositivo o browser';
   return 'Serve la tua autorizzazione';
 }
-async function deliverEventNotification(event){
+async function deliverEventNotification(event, replay){
   const prefs = S.notificationPreferences;
   if(!prefs.enabled || !prefs[event.category]) return;
   if(event.actor_profile_id && S.profile && event.actor_profile_id===S.profile.id) return;
+
+  // Il server le ha già spedite mentre l'app era chiusa: non mostriamole due volte.
+  if(replay && S.pushActive){
+    if(document.visibilityState==='visible') toast(`${event.title}: ${event.body}`);
+    return;
+  }
 
   const native = nativeNotifications();
   try{
@@ -350,7 +406,7 @@ async function deliverEventNotification(event){
 
   if(document.visibilityState==='visible') toast(`${event.title}: ${event.body}`);
 }
-async function handleAppEvent(event){
+async function handleAppEvent(event, replay){
   if(!event || !event.id) return;
   if(event.workspace_id && event.workspace_id!==S.workspace?.id) return;
   // I ruoli arrivano dal profilo nel database, non dal token della sessione.
@@ -358,7 +414,7 @@ async function handleAppEvent(event){
     await loadInstructors();
   }
   localStorage.setItem(notificationCursorKey(), String(event.id));
-  await deliverEventNotification(event);
+  await deliverEventNotification(event, replay);
 }
 async function catchUpNotificationEvents(){
   if(!S.profile || !S.workspace) return;
@@ -377,7 +433,9 @@ async function catchUpNotificationEvents(){
     const {data, error} = await sb.from('app_events').select('*')
       .eq('workspace_id', S.workspace.id).gt('id', cursor).order('id', {ascending:true}).limit(10);
     if(error) return;
-    for(const event of (data||[])) await handleAppEvent(event);
+    // recupero all'apertura: con le push attive queste notifiche sono già
+    // arrivate sul telefono, qui serve solo allineare i dati.
+    for(const event of (data||[])) await handleAppEvent(event, true);
   }catch(e){}
 }
 async function startNotificationListener(){
@@ -825,6 +883,7 @@ async function activateProfile(prof, reason){
   await loadNotificationPreferences();
   render();
   await startNotificationListener();
+  await syncPushToken();
   if(reason==='login' && S.myProfiles.length>1) toast(`Sei in "${ws.name}" — tocca il nome in alto per cambiare spazio.`);
   else if(reason==='switch') toast(`Passato a "${ws.name}".`);
   else if(reason==='created') toast(`Nuovo spazio "${ws.name}" creato.`);
@@ -1119,6 +1178,7 @@ async function doLogout(){
     try{ await sb.removeChannel(notificationChannel); }catch(e){}
     notificationChannel = null;
   }
+  await removePushToken();
   // Se il token è già scaduto signOut può fallire: l'uscita deve comunque riuscire.
   try{ await sb.auth.signOut(); }catch(e){ console.error(e); }
   clearAuthWatchdog();

@@ -770,6 +770,10 @@
     web: () => Promise.resolve().then(() => (init_web(), web_exports)).then((m) => new m.LocalNotificationsWeb())
   });
 
+  // node_modules/@capacitor/push-notifications/dist/esm/index.js
+  init_dist();
+  var PushNotifications = registerPlugin("PushNotifications", {});
+
   // native-entry.js
   var CHANNELS = {
     attendance: { name: "Presenze e assenze", description: "Modifiche alle presenze e alle assenze" },
@@ -802,6 +806,26 @@
     if (value === "denied") return "denied";
     return "prompt";
   }
+  var pushToken = null;
+  var pushListenersReady = false;
+  var pushWaiters = [];
+  function resolvePushWaiters(token, error) {
+    const waiters = pushWaiters;
+    pushWaiters = [];
+    waiters.forEach(({ resolve, reject }) => error ? reject(error) : resolve(token));
+  }
+  function ensurePushListeners() {
+    if (pushListenersReady) return;
+    pushListenersReady = true;
+    PushNotifications.addListener("registration", (token) => {
+      pushToken = token && token.value ? token.value : null;
+      resolvePushWaiters(pushToken, null);
+    });
+    PushNotifications.addListener("registrationError", (err) => {
+      console.warn("Registrazione push non riuscita", err);
+      resolvePushWaiters(null, null);
+    });
+  }
   window.PresencerNative = {
     isNative: Capacitor.isNativePlatform(),
     async checkPermission() {
@@ -814,6 +838,37 @@
       const result = await LocalNotifications.requestPermissions();
       if (result.display === "granted") await ensureChannels();
       return normalizePermission(result.display);
+    },
+    /* Chiede a Firebase il recapito di questo telefono. Restituisce il token
+       oppure null se le push non sono disponibili (permesso negato, APK senza
+       google-services.json, dispositivo senza servizi Google). */
+    async registerPush() {
+      if (!Capacitor.isNativePlatform()) return null;
+      try {
+        const permission = await PushNotifications.requestPermissions();
+        if (permission.receive !== "granted") return null;
+        await ensureChannels();
+        ensurePushListeners();
+        if (pushToken) return pushToken;
+        const waiting = new Promise((resolve, reject) => pushWaiters.push({ resolve, reject }));
+        await PushNotifications.register();
+        return await Promise.race([
+          waiting,
+          new Promise((resolve) => setTimeout(() => resolve(null), 1e4))
+        ]);
+      } catch (err) {
+        console.warn("Push non disponibili", err);
+        return null;
+      }
+    },
+    async unregisterPush() {
+      if (!Capacitor.isNativePlatform()) return;
+      try {
+        await PushNotifications.unregister();
+      } catch (err) {
+        console.warn(err);
+      }
+      pushToken = null;
     },
     async notify(event) {
       if (!Capacitor.isNativePlatform()) return;
