@@ -6,6 +6,12 @@
       "runtimeExecutable": "npx",
       "runtimeArgs": ["--yes", "serve", ".", "-l", "8795"],
       "port": 8795
+    },
+    {
+      "name": "presencer-preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["tests/serve-ui.mjs", "8796"],
+      "port": 8796
     }
   ]
 }

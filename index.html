@@ -244,7 +244,10 @@
   .modal-bg{position:fixed;inset:0;background:rgba(0,0,15,.45);z-index:50;display:flex;
     align-items:flex-end;justify-content:center;overscroll-behavior:contain}
   .modal{background:#fff;border-radius:20px 20px 0 0;padding:20px;width:100%;max-width:480px;
-    max-height:88vh;overflow:auto;animation:up .18s ease-out}
+    max-height:88vh;overflow:auto}
+  /* L'animazione di entrata parte solo quando il popup si apre davvero:
+     prima ripartiva a ogni ridisegno e sembrava un lampeggio. */
+  .modal.enter{animation:up .18s ease-out}
   @media (min-width:560px){
     .modal-bg{align-items:center}
     .modal{border-radius:20px}

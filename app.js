@@ -17,7 +17,7 @@ const NOTIFICATION_TYPES = [
   {id:'members', label:'Membri', description:'Quando entra, cambia ruolo o viene rimosso un membro.'},
 ];
 const DEFAULT_NOTIFICATION_PREFERENCES = {
-  enabled:false,
+  enabled:true,   // di serie le notifiche sono attive: manca solo il permesso del dispositivo
   attendance:true,
   recurring:true,
   schedule:true,
@@ -59,6 +59,7 @@ const S = {
   presenceSaving: false,
   weekLoading: false,
   weekLoadFailed: false,
+  weekDataContext: null,  // a quale settimana/spazio appartengono i dati gia' a schermo
   presenceNeedsRefresh: false,
   syncBusy: false,
   dataError: null,
@@ -279,10 +280,13 @@ async function loadNotificationPreferences(){
    Il token è il "recapito" del telefono: lo salviamo accanto al profilo così la
    Edge Function sa dove spedire. Se le push non sono disponibili non succede
    nulla: restano le notifiche locali di quando l'app è aperta. */
+let pushSyncInFlight = false;
 async function syncPushToken(){
   const native = nativeNotifications();
   if(!native || !native.registerPush || !S.profile || !S.session) return;
   if(!S.notificationPreferences.enabled) return;
+  if(pushSyncInFlight) return;   // un solo tentativo per volta
+  pushSyncInFlight = true;
   try{
     const token = await native.registerPush();
     if(!token){ S.pushActive = false; return; }
@@ -304,7 +308,30 @@ async function syncPushToken(){
   }catch(err){
     console.warn('Push non attivate', err);
     S.pushActive = false;
+  }finally{
+    pushSyncInFlight = false;
   }
+}
+
+/* Al primo avvio il recapito puo' mancare: rete non ancora pronta, servizi Google
+   in ritardo, Firebase che tarda a rispondere. Senza un nuovo tentativo il telefono
+   resta senza indirizzo e le push non arrivano piu', finche' non si spengono e
+   riaccendono le notifiche a mano. Qui riproviamo da soli, in silenzio. */
+function retryPushTokenIfMissing(){
+  if(S.pushActive) return;
+  if(!S.notificationPreferences.enabled) return;
+  if(S.notificationPermission!=='granted') return;   // niente richieste a sorpresa
+  syncPushToken();
+}
+
+/* Le notifiche sono attive di serie: se il dispositivo non ha ancora deciso glielo
+   chiediamo una volta. Sul web resta il pulsante "Consenti notifiche", perche'
+   li' la richiesta deve partire da un tuo gesto. Un rifiuto resta un rifiuto. */
+async function requestNotificationPermissionIfDefault(){
+  if(!nativeNotifications()) return;
+  if(!S.notificationPreferences.enabled) return;
+  if(S.notificationPermission!=='prompt') return;
+  await enableDeviceNotifications();
 }
 
 /* All'uscita togliamo il recapito, altrimenti il telefono continuerebbe a
@@ -462,6 +489,7 @@ document.addEventListener('visibilitychange', ()=>{
     refreshSessionIfStale();
     loadInstructors();
     catchUpNotificationEvents();
+    retryPushTokenIfMissing();
   }
   if(S.view==='reconnect') retryAfterReconnect();
 });
@@ -470,6 +498,7 @@ document.addEventListener('visibilitychange', ()=>{
 // prima che WiFi o dati siano pronti.
 window.addEventListener('online', ()=>{
   if(S.view==='reconnect') retryAfterReconnect();
+  if(S.view==='app' && !isGuest()) retryPushTokenIfMissing();
 });
 
 /* Rinnova il token se sta per scadere (o è già scaduto) */
@@ -574,10 +603,19 @@ async function refreshCurrentData(){
   }
 }
 
+/* Il messaggio vive fuori dall'albero della pagina: comparire o sparire non
+   costringe piu' l'app a ridisegnarsi (e a far lampeggiare popup e calendario). */
+let toastEl = null, toastTimer = null;
 function toast(msg){
   S.toast = msg;
-  render();
-  setTimeout(()=>{ if(S.toast===msg){ S.toast=''; render(); } }, 2600);
+  if(!toastEl){ toastEl = document.createElement('div'); toastEl.className = 'toast'; }
+  toastEl.textContent = msg;
+  if(!toastEl.isConnected) document.body.appendChild(toastEl);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{
+    S.toast = '';
+    if(toastEl && toastEl.isConnected) toastEl.remove();
+  }, 2600);
 }
 
 function esc(s){
@@ -882,6 +920,7 @@ async function activateProfile(prof, reason){
   await refreshWeekData();
   await loadNotificationPreferences();
   render();
+  await requestNotificationPermissionIfDefault();
   await startNotificationListener();
   await syncPushToken();
   if(reason==='login' && S.myProfiles.length>1) toast(`Sei in "${ws.name}" — tocca il nome in alto per cambiare spazio.`);
@@ -1251,6 +1290,7 @@ async function refreshWeekData(){
     // tardiva di una settimana/spazio che l'utente ha già lasciato.
     Object.assign(S, {slots, extraSlots, recurring, attendance:attendance.concat(extraAttendance), lessonLogs:logs.concat(extraLogs)});
     S.selectedCalendarId = getEffectiveCalendarForWeek(monday);
+    S.weekDataContext = context;
     S.weekLoadFailed = false;
     S.presenceNeedsRefresh = false;
     return true;
@@ -1748,18 +1788,68 @@ function unlockScroll(){
   window.scrollTo(0, savedScrollY);
 }
 function openModal(m){ S.modal = m; lockScroll(); render(); }
-function closeModal(){ S.modal = null; unlockScroll(); render(); }
+function closeModal(){ S.modal = null; animatedModal = null; unlockScroll(); render(); }
 
 /* ================= RENDER ================= */
+/* La pagina si ricostruisce per intero a ogni aggiornamento. Farlo "a caldo" la fa
+   lampeggiare: lo scorrimento salta, il testo che stai scrivendo sparisce, i popup
+   ripartono con l'animazione. Qui l'albero nuovo si monta staccato ed entra in un
+   colpo solo, e cio' che appartiene a te (fuoco, cursore, scorrimento) torna dov'era.
+   Piu' chiamate ravvicinate a render() diventano un solo aggiornamento. */
+let renderScheduled = false;
+let animatedModal = null;
 function render(){
-  APP.innerHTML = '';
-  if(S.view==='loading'){ APP.innerHTML = '<div class="spinner"></div>'; return; }
-  if(S.view==='setup'){ APP.appendChild(renderSetup()); return; }
-  if(S.view==='guestname'){ APP.appendChild(renderGuestName()); return; }
-  if(S.view==='auth'){ APP.appendChild(renderAuth()); return; }
-  if(S.view==='reconnect'){ APP.appendChild(renderReconnect()); return; }
-  if(S.view==='no-workspace'){ APP.appendChild(renderNoWorkspace()); return; }
-  if(S.view==='app'){ APP.appendChild(renderShell()); return; }
+  if(renderScheduled) return;
+  renderScheduled = true;
+  Promise.resolve().then(()=>{ renderScheduled = false; renderNow(); });
+}
+
+function captureUi(){
+  const ui = {pageY: window.scrollY || window.pageYOffset || 0, scroll: new Map(), focus: null};
+  APP.querySelectorAll('[data-keep-scroll]').forEach(el=>{
+    if(el.scrollLeft || el.scrollTop) ui.scroll.set(el.getAttribute('data-keep-scroll'), [el.scrollLeft, el.scrollTop]);
+  });
+  const a = document.activeElement;
+  if(a && a.id && APP.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)){
+    ui.focus = {id:a.id, value:a.value, start:null, end:null};
+    try{ ui.focus.start = a.selectionStart; ui.focus.end = a.selectionEnd; }catch(e){}
+  }
+  return ui;
+}
+
+function restoreUi(ui){
+  ui.scroll.forEach((pos, key)=>{
+    const el = APP.querySelector('[data-keep-scroll="'+key+'"]');
+    if(el){ el.scrollLeft = pos[0]; el.scrollTop = pos[1]; }
+  });
+  const f = ui.focus;
+  if(f){
+    const el = document.getElementById(f.id);
+    // Solo il campo che stavi usando conserva quello che avevi scritto: gli altri
+    // devono restare liberi di cambiare quando cambiano i dati.
+    if(el && APP.contains(el)){
+      if(el.value !== f.value) el.value = f.value;
+      el.focus({preventScroll:true});
+      if(f.start!=null){ try{ el.setSelectionRange(f.start, f.end); }catch(e){} }
+    }
+  }
+  if(!document.body.classList.contains('modal-open') && (window.scrollY||0) !== ui.pageY) window.scrollTo(0, ui.pageY);
+}
+
+function renderNow(){
+  const ui = captureUi();
+  const next = document.createDocumentFragment();
+  if(S.view==='loading'){ const sp = document.createElement('div'); sp.className = 'spinner'; next.appendChild(sp); }
+  else if(S.view==='setup') next.appendChild(renderSetup());
+  else if(S.view==='guestname') next.appendChild(renderGuestName());
+  else if(S.view==='auth') next.appendChild(renderAuth());
+  else if(S.view==='reconnect') next.appendChild(renderReconnect());
+  else if(S.view==='no-workspace') next.appendChild(renderNoWorkspace());
+  else if(S.view==='app') next.appendChild(renderShell());
+  // Uno scambio solo: la pagina non passa mai per lo stato vuoto.
+  if(APP.replaceChildren) APP.replaceChildren(next);
+  else { APP.innerHTML = ''; APP.appendChild(next); }
+  restoreUi(ui);
 }
 
 /* Sei ancora dentro: è solo la rete che manca. Nessun logout, solo un "riprova". */
@@ -2001,7 +2091,6 @@ function renderShell(){
   if(im) wrap.appendChild(renderInstallBar(im, true));
 
   if(S.modal) wrap.appendChild(renderModal());
-  if(S.toast){ const t=document.createElement('div'); t.className='toast'; t.textContent=S.toast; wrap.appendChild(t); }
 
   return wrap;
 }
@@ -2079,7 +2168,10 @@ function renderPresenze(){
   });
 
   const host = d.querySelector('#daysHost');
-  if(S.weekLoading || S.weekLoadFailed){
+  // I giorni restano a schermo mentre la stessa settimana si aggiorna: svuotarli
+  // farebbe lampeggiare il calendario a ogni salvataggio o sincronizzazione.
+  const weekDataUsable = S.weekDataContext === presenceContext();
+  if(S.weekLoadFailed || (S.weekLoading && !weekDataUsable)){
     host.innerHTML = `<p class="hint" role="status">${S.weekLoading ? 'Caricamento presenze…' : 'Presenze non disponibili. Premi “Aggiorna dati” per riprovare.'}</p>`;
     return d;
   }
@@ -2201,6 +2293,7 @@ function renderDayMatrix(dt){
   const cols = people.concat(guests);
 
   const wrapT = document.createElement('div'); wrapT.className='matrixwrap card';
+  wrapT.setAttribute('data-keep-scroll', 'matrix-'+dateStr);
   const colHead = c=>{
     const first = c.name.split(' ')[0] || '?';
     const avatarInner = c.avatar ? `<img src="${esc(c.avatar)}" alt="">` : esc(first.slice(0,1).toUpperCase());
@@ -2499,6 +2592,8 @@ function renderModal(){
   bg.onclick = (e)=>{ if(e.target===bg) closeModal(); };
   const box = document.createElement('div');
   box.className = 'modal';
+  box.setAttribute('data-keep-scroll', 'modal');
+  if(animatedModal !== S.modal){ box.classList.add('enter'); animatedModal = S.modal; }
   bg.appendChild(box);
 
   const m = S.modal;
