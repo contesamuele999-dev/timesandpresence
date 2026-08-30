@@ -8,6 +8,13 @@ const APP = document.getElementById('app');
 const WEEKDAYS = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'];
 const MONTHS = ['gen','feb','mar','apr','mag','giu','lug','ago','set','ott','nov','dic'];
 const PERIOD_LABEL = {estate:'Estate', inverno:'Inverno', extra:'Extra', personalizzato:'Personalizzato'};
+// Campi email: niente maiuscola automatica né correttore, altrimenti sulle
+// tastiere mobili l'indirizzo arriva sporcato e l'accesso fallisce.
+const EMAIL_ATTRS = 'type="email" inputmode="email" autocomplete="email" autocapitalize="none" autocorrect="off" spellcheck="false"';
+// Indirizzo con cui il link di recupero riapre l'APK invece del browser. Lo
+// schema è dichiarato in android/app/src/main/AndroidManifest.xml e va aggiunto
+// ai Redirect URLs del progetto Supabase.
+const NATIVE_RECOVERY_URL = 'it.presencer.app://recovery';
 const NOTIFICATION_TYPES = [
   {id:'attendance', label:'Presenze e assenze', description:'Quando una presenza viene aggiunta, cambiata o rimossa.'},
   {id:'recurring', label:'Presenze ricorrenti', description:'Quando cambia una presenza settimanale ricorrente.'},
@@ -28,9 +35,11 @@ const DEFAULT_NOTIFICATION_PREFERENCES = {
 
 let sb = null;
 const S = {
-  view: 'loading',      // loading | setup | auth | guestname | reconnect | no-workspace | app
-  authTab: 'login',     // login | register | join
+  view: 'loading',      // loading | setup | auth | guestname | reconnect | no-workspace | newpass | app
+  authTab: 'login',     // login | register | join | reset
   authErr: '',
+  authMsg: '',          // messaggio positivo sulla schermata di accesso (es. "link inviato")
+  authEmail: '',        // email già digitata, riportata sulla schermata di recupero
   reconnectMsg: '',     // testo della schermata "sei collegato ma manca la rete"
   busy: false,
 
@@ -92,9 +101,12 @@ let rememberMe = localStorage.getItem('rememberMe') !== '0'; // default: sì, ri
 //   profilo e spazio esistano, l'ascoltatore non deve intromettersi)
 // - signInBusy: caricamento post-login già in corso (evita doppi caricamenti)
 // - authWatchdog: sblocca il pulsante se la risposta non arriva mai
+// - recoveryFlow: si arriva dal link "password dimenticata": la sessione che
+//   nasce da quel link serve solo a scegliere la nuova password, non a entrare
 let authFlowBusy = false;
 let signInBusy = false;
 let authWatchdog = null;
+let recoveryFlow = false;
 
 // storage per la sessione Supabase: se "ricordami" è attivo usa localStorage (persiste alla
 // chiusura del browser), altrimenti sessionStorage (sparisce a fine sessione). In lettura
@@ -696,7 +708,7 @@ function getEffectiveCalendarForWeek(monday){
 }
 
 /* ---------------- boot ---------------- */
-function boot(){
+async function boot(){
   if(!window.SUPABASE_URL || window.SUPABASE_URL.indexOf('INCOLLA_QUI') === 0){
     S.view='setup'; render(); return;
   }
@@ -724,6 +736,39 @@ function boot(){
     return;
   }
 
+  // Sul web il link "password dimenticata" riporta qui con i token nel frammento
+  // (#access_token=...&type=recovery). Va riconosciuto PRIMA che parta l'accesso
+  // normale, altrimenti si entrerebbe nell'app senza cambiare niente.
+  const webLink = readAuthLink(hashParams(location.hash));
+  if(webLink && webLink.type==='recovery'){
+    // Il frammento resta dov'è: a leggerlo (e a ripulirlo) ci pensa supabase-js.
+    recoveryFlow = true;
+    S.view = 'loading';
+  } else if(webLink && webLink.type==='error'){
+    S.view = 'auth'; S.authTab = 'login'; S.authErr = webLink.message;
+    history.replaceState(null, '', location.pathname + location.search);
+    render();
+  }
+
+  // Nell'APK lo stesso link non passa dal frammento della pagina: Android apre
+  // l'app con l'indirizzo it.presencer.app://recovery#... Va letto qui, prima
+  // dell'accesso, sia quando l'app parte da zero sia quando è già aperta.
+  const native = window.PresencerNative;
+  let launchUrl = null;
+  if(native && native.isNative){
+    if(native.onAppUrlOpen) native.onAppUrlOpen(handleAppLink);
+    if(native.getLaunchUrl){
+      try{ launchUrl = await native.getLaunchUrl(); }catch(err){ console.warn(err); }
+    }
+    const launchLink = readAuthLink(hashParams(launchUrl));
+    if(!launchLink) launchUrl = null;
+    else if(launchLink.type==='error'){
+      // Non blocchiamo l'avvio: il messaggio compare se si finisce sull'accesso.
+      S.authTab = 'login'; S.authErr = launchLink.message;
+      launchUrl = null;
+    }
+  }
+
   sb.auth.onAuthStateChange((event, session)=>{
     // supabase-js invoca questo callback mentre tiene il lock interno sull'auth:
     // chiamarci dentro altre API (sb.from, getSession...) può bloccare tutto a
@@ -731,8 +776,17 @@ function boot(){
     setTimeout(()=> onAuthEvent(event, session), 0);
   });
 
+  // Il link ha appena aperto l'app: la sessione da usare è la sua, non quella
+  // eventualmente rimasta in memoria.
+  if(launchUrl){ handleAppLink(launchUrl); return; }
+
   sb.auth.getSession().then(({data})=>{
     if(authFlowBusy) return;                 // registrazione in corso: la gestisce lei
+    if(recoveryFlow){
+      if(data && data.session) S.session = data.session;
+      enterPasswordRecovery();
+      return;
+    }
     if(data && data.session) startSession(data.session);
     else if(S.view==='loading'){ S.view='auth'; render(); }
   }).catch(err=>{
@@ -754,6 +808,12 @@ function onAuthEvent(event, session){
     notificationChannel = null;
     S.session=null; S.profile=null; S.workspace=null; S.myProfiles=[]; S.myWorkspaces=[];
     S.busy=false; S.view='auth'; render(); return;
+  }
+  // Recupero password: la sessione nata dal link vale solo per impostare la
+  // nuova password, non per entrare nell'app.
+  if(recoveryFlow){
+    if(session){ S.session = session; enterPasswordRecovery(); }
+    return;
   }
   // Durante registrazione/join la sessione arriva mentre profilo e spazio non
   // esistono ancora: entrare qui mostrerebbe "Profilo non trovato" a caso.
@@ -1016,7 +1076,7 @@ async function doLogin(email, password){
   const bad = validateCredentials(email, password);
   if(bad){ S.authErr = bad; render(); return; }
 
-  S.busy=true; S.authErr=''; render();
+  S.busy=true; S.authErr=''; S.authMsg=''; render();
   armAuthWatchdog('Accesso lento o interrotto. Controlla la connessione e riprova.');
   let error = null;
   try{
@@ -1030,6 +1090,158 @@ async function doLogin(email, password){
   }
   // Da qui prosegue onAuthEvent → handleSignedIn: teniamo il pulsante su
   // "Attendere..." finché il profilo non è caricato (o scatta il watchdog).
+}
+
+/* ---------------- recupero password ----------------
+   Il link arriva per email e deve riportare l'utente sull'app: serve perciò
+   l'indirizzo pubblico dove Presencer è ospitato. Dentro l'APK location.origin
+   è un indirizzo interno al telefono, che in un link non porta da nessuna parte. */
+function recoveryRedirectUrl(){
+  // APK: il link riapre l'app grazie allo schema dichiarato nel manifest Android.
+  if(window.PresencerNative && window.PresencerNative.isNative) return NATIVE_RECOVERY_URL;
+  const configured = (window.APP_URL || '').trim();
+  if(configured) return configured.replace(/[#?].*$/, '');
+  return location.origin + location.pathname;
+}
+
+/* Il frammento (la parte dopo #) di un indirizzo, sia esso la pagina corrente
+   o l'indirizzo con cui Android ha aperto l'app. */
+function hashParams(url){
+  const at = (url || '').indexOf('#');
+  return new URLSearchParams(at < 0 ? '' : url.slice(at + 1));
+}
+
+/* Che cosa porta un ritorno da Supabase: il recupero password, il suo errore,
+   o niente che ci riguardi. */
+function readAuthLink(params){
+  if(params.get('type')==='recovery'){
+    return {type:'recovery', accessToken: params.get('access_token'), refreshToken: params.get('refresh_token')};
+  }
+  const code = (params.get('error_code') || params.get('error') || '').toLowerCase();
+  if(!code) return null;
+  return {type:'error', message: /expired|otp/.test(code)
+    ? 'Il link è scaduto o è già stato usato. Richiedine uno nuovo da "Password dimenticata?".'
+    : 'Il link non è valido: richiedine uno nuovo da "Password dimenticata?".'};
+}
+
+/* APK: un link esterno ha aperto l'app. Qui i token non li vede supabase-js
+   (non c'è nessun frammento nella pagina), quindi la sessione la apriamo noi. */
+async function handleAppLink(url){
+  const link = readAuthLink(hashParams(url));
+  if(!link) return;
+  if(link.type==='error'){
+    // Chi sta già lavorando non viene buttato fuori per un link scaduto.
+    if(S.view==='app'){ toast(link.message); return; }
+    recoveryFlow = false;
+    S.authTab = 'login'; S.authErr = link.message; S.authMsg = '';
+    S.view = 'auth'; render(); return;
+  }
+  if(!link.accessToken || !link.refreshToken){
+    recoveryFlow = false;
+    S.authTab = 'reset'; S.authMsg = '';
+    S.authErr = 'Il link non è più valido: richiedine uno nuovo.';
+    S.view = 'auth'; render(); return;
+  }
+
+  recoveryFlow = true;
+  S.busy = false; S.authErr = ''; S.authMsg = '';
+  S.view = 'loading'; render();
+  try{
+    const {data, error} = await sb.auth.setSession({access_token: link.accessToken, refresh_token: link.refreshToken});
+    if(error) throw error;
+    S.session = data.session;
+  }catch(err){
+    console.error(err);
+    recoveryFlow = false;
+    S.authTab = 'reset';
+    S.authErr = authErrorMessage(err, 'Il link non è più valido: richiedine uno nuovo.');
+    S.view = 'auth'; render(); return;
+  }
+  // setSession fa scattare anche onAuthEvent, che porta qui lo stesso: la
+  // schermata si apre una volta sola (enterPasswordRecovery se ne accorge).
+  enterPasswordRecovery();
+}
+
+/* Chiede a Supabase di spedire il link per reimpostare la password */
+async function doResetPassword(email){
+  if(S.busy) return;
+  email = cleanEmail(email);
+  S.authEmail = email;
+  if(!email){ S.authErr = 'Inserisci la tua email.'; render(); return; }
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ S.authErr = 'L\'indirizzo email non sembra valido.'; render(); return; }
+  const redirectTo = recoveryRedirectUrl();
+
+  S.busy = true; S.authErr = ''; S.authMsg = ''; render();
+  let error = null;
+  try{
+    ({error} = await sb.auth.resetPasswordForEmail(email, {redirectTo}));
+  }catch(err){ error = err; }
+  S.busy = false;
+  if(error){
+    S.authErr = authErrorMessage(error, 'Non riesco a inviare l\'email di recupero. Riprova tra poco.');
+  } else {
+    // Non diciamo se quell'indirizzo esiste davvero: sarebbe un modo comodo per
+    // scoprire chi è registrato.
+    S.authMsg = 'Se esiste un account con questa email, ti è arrivato il link per scegliere una nuova password. Controlla la posta, anche nello spam.';
+  }
+  render();
+}
+
+/* Siamo tornati dal link: da qui si passa solo per la nuova password */
+function enterPasswordRecovery(){
+  if(S.view==='newpass') return;
+  if(!S.session){
+    recoveryFlow = false;
+    S.view = 'auth'; S.authTab = 'reset'; S.authMsg = '';
+    S.authErr = 'Il link non è più valido: richiedine uno nuovo.';
+    render(); return;
+  }
+  recoveryFlow = true;
+  clearAuthWatchdog();
+  S.busy = false; S.authErr = ''; S.authMsg = '';
+  S.view = 'newpass'; render();
+}
+
+/* Salva la nuova password e prosegue dritto dentro l'app: chi è arrivato fin
+   qui ha appena dimostrato di leggere la posta di quell'indirizzo. */
+async function doSetNewPassword(pass1, pass2){
+  if(S.busy) return;
+  if(!pass1 || pass1.length < 6){ S.authErr = 'La password deve avere almeno 6 caratteri.'; render(); return; }
+  if(pass1 !== pass2){ S.authErr = 'Le due password non coincidono.'; render(); return; }
+
+  S.busy = true; S.authErr = ''; render();
+  let error = null;
+  try{
+    ({error} = await sb.auth.updateUser({password: pass1}));
+  }catch(err){ error = err; }
+  if(error){
+    S.busy = false;
+    S.authErr = authErrorMessage(error, 'Non riesco a salvare la nuova password. Il link potrebbe essere scaduto: richiedine uno nuovo.');
+    render(); return;
+  }
+  recoveryFlow = false;
+  clearRecoveryHash();
+  S.busy = false;
+  toast('Password aggiornata.');
+  S.view = 'loading'; render();
+  armAuthWatchdog('Accesso lento o interrotto. Controlla la connessione e riprova.');
+  await handleSignedIn();
+}
+
+/* Normalmente il frammento del link lo toglie supabase-js appena l'ha letto.
+   Se per qualche motivo resta, un ricaricamento riporterebbe alla schermata
+   della nuova password: meglio ripulirlo appena il recupero è concluso. */
+function clearRecoveryHash(){
+  if(/type=recovery/.test(location.hash || '')) history.replaceState(null, '', location.pathname + location.search);
+}
+
+/* Ci ha ripensato: si chiude la sessione temporanea nata dal link */
+async function cancelPasswordRecovery(){
+  recoveryFlow = false;
+  clearRecoveryHash();
+  S.busy = false; S.authErr = ''; S.authMsg = '';
+  S.authTab = 'login'; S.view = 'auth'; render();
+  try{ await sb.auth.signOut(); }catch(e){ console.error(e); }
 }
 
 async function doRegisterWorkspace(name, wsName, email, password){
@@ -1130,6 +1342,7 @@ function authFail(message){
   authFlowBusy = false;
   S.busy = false;
   S.authErr = message;
+  S.authMsg = '';
   S.view = 'auth';
   render();
 }
@@ -1224,7 +1437,8 @@ async function doLogout(){
   try{ await sb.auth.signOut(); }catch(e){ console.error(e); }
   clearAuthWatchdog();
   S.session=null; S.profile=null; S.workspace=null; S.myProfiles=[]; S.myWorkspaces=[];
-  S.busy=false; S.authErr=''; S.view='auth'; S.tab='presenze';
+  recoveryFlow = false;
+  S.busy=false; S.authErr=''; S.authMsg=''; S.authTab='login'; S.view='auth'; S.tab='presenze';
   render();
 }
 
@@ -2071,6 +2285,7 @@ function renderNow(){
   else if(S.view==='auth') next.appendChild(renderAuth());
   else if(S.view==='reconnect') next.appendChild(renderReconnect());
   else if(S.view==='no-workspace') next.appendChild(renderNoWorkspace());
+  else if(S.view==='newpass') next.appendChild(renderNewPassword());
   else if(S.view==='app') next.appendChild(renderShell());
   // Uno scambio solo: la pagina non passa mai per lo stato vuoto.
   if(APP.replaceChildren) APP.replaceChildren(next);
@@ -2172,6 +2387,7 @@ function renderGuestName(){
 }
 
 function renderAuth(){
+  if(S.authTab==='reset') return renderResetRequest();
   const d = document.createElement('div');
   d.className = 'authwrap';
   const tab = S.authTab;
@@ -2185,21 +2401,21 @@ function renderAuth(){
           <button data-t="join" class="${tab==='join'?'active':''}">Ho un codice</button>
         </div>
         ${S.authErr ? `<div class="errbox" role="alert">${esc(S.authErr)}</div>` : ''}
+        ${S.authMsg ? `<div class="okbox" role="status">${esc(S.authMsg)}</div>` : ''}
         <form id="authform" novalidate></form>
       </div>
     </div>`;
-  d.querySelectorAll('.authtabs button').forEach(b=> b.onclick = ()=>{ S.authTab=b.dataset.t; S.authErr=''; render(); });
+  d.querySelectorAll('.authtabs button').forEach(b=> b.onclick = ()=>{ S.authTab=b.dataset.t; S.authErr=''; S.authMsg=''; render(); });
 
-  // Campi email: niente maiuscola automatica né correttore, altrimenti sulle
-  // tastiere mobili l'indirizzo arriva sporcato e l'accesso fallisce.
-  const emailAttrs = 'type="email" inputmode="email" autocomplete="email" autocapitalize="none" autocorrect="off" spellcheck="false"';
+  const emailAttrs = EMAIL_ATTRS;
   const form = d.querySelector('#authform');
   if(tab==='login'){
     form.innerHTML = `
       <label class="field"><span>Email</span><input ${emailAttrs} id="a_email"></label>
       <label class="field"><span>Password</span><input type="password" autocomplete="current-password" id="a_pass"></label>
       <label class="checkrow"><input type="checkbox" id="a_remember" ${rememberMe?'checked':''}><span>Ricordami su questo dispositivo</span></label>
-      <button type="submit" class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Accedi'}</button>`;
+      <button type="submit" class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Accedi'}</button>
+      <div class="linkline"><button type="button" id="a_forgot">Password dimenticata?</button></div>`;
   } else if(tab==='register'){
     form.innerHTML = `
       <label class="field"><span>Il tuo nome</span><input type="text" autocomplete="name" id="a_name"></label>
@@ -2221,6 +2437,12 @@ function renderAuth(){
   // Un vero <form>: così l'invio da tastiera (Enter / tasto "Vai" del telefono)
   // dal campo password funziona come il tocco sul pulsante.
   const val = id => { const el = form.querySelector(id); return el ? el.value : ''; };
+  const forgot = form.querySelector('#a_forgot');
+  if(forgot) forgot.onclick = ()=>{
+    S.authEmail = cleanEmail(val('#a_email'));
+    S.authTab = 'reset'; S.authErr = ''; S.authMsg = '';
+    render();
+  };
   form.onsubmit = (e)=>{
     e.preventDefault();
     if(S.busy) return;
@@ -2237,6 +2459,64 @@ function renderAuth(){
   };
   const im = installMode();
   if(im) d.appendChild(renderInstallBar(im, false));
+  return d;
+}
+
+/* Schermata "ho dimenticato la password": chiede solo l'email */
+function renderResetRequest(){
+  const d = document.createElement('div');
+  d.className = 'authwrap';
+  d.innerHTML = `
+    <div class="authbox">
+      <div class="logo"><div class="mark">🔑</div><h1>Password dimenticata</h1><p>Ti mandiamo un link per sceglierne una nuova.</p></div>
+      <div class="card">
+        ${S.authErr ? `<div class="errbox" role="alert">${esc(S.authErr)}</div>` : ''}
+        ${S.authMsg ? `<div class="okbox" role="status">${esc(S.authMsg)}</div>` : ''}
+        <form id="resetform" novalidate>
+          <label class="field"><span>Email</span><input ${EMAIL_ATTRS} id="r_email" value="${esc(S.authEmail)}"></label>
+          <button type="submit" class="btn block" ${S.busy?'disabled':''}>${S.busy?'Invio...':'Invia il link'}</button>
+        </form>
+        <p class="hint">Il link vale poco tempo e una volta sola: se scade, richiedilo di nuovo.</p>
+        <div class="linkline"><button type="button" id="r_back">Torna all'accesso</button></div>
+      </div>
+    </div>`;
+  const form = d.querySelector('#resetform');
+  form.onsubmit = (e)=>{
+    e.preventDefault();
+    if(S.busy) return;
+    doResetPassword(form.querySelector('#r_email').value);
+  };
+  d.querySelector('#r_back').onclick = ()=>{
+    S.authTab = 'login'; S.authErr = ''; S.authMsg = ''; render();
+  };
+  return d;
+}
+
+/* Ultimo passo del recupero: si sceglie la nuova password */
+function renderNewPassword(){
+  const d = document.createElement('div');
+  d.className = 'authwrap';
+  d.innerHTML = `
+    <div class="authbox">
+      <div class="logo"><div class="mark">🔑</div><h1>Nuova password</h1><p>Scegli la password che userai da adesso.</p></div>
+      <div class="card">
+        ${S.authErr ? `<div class="errbox" role="alert">${esc(S.authErr)}</div>` : ''}
+        <form id="newpassform" novalidate>
+          <label class="field"><span>Nuova password</span><input type="password" autocomplete="new-password" id="np_pass1"></label>
+          <label class="field"><span>Ripeti la password</span><input type="password" autocomplete="new-password" id="np_pass2"></label>
+          <button type="submit" class="btn block" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Salva ed entra'}</button>
+          <p class="hint">Almeno 6 caratteri.</p>
+        </form>
+        <button class="btn ghost block" id="np_cancel" style="margin-top:8px">Annulla</button>
+      </div>
+    </div>`;
+  const form = d.querySelector('#newpassform');
+  form.onsubmit = (e)=>{
+    e.preventDefault();
+    if(S.busy) return;
+    doSetNewPassword(form.querySelector('#np_pass1').value, form.querySelector('#np_pass2').value);
+  };
+  d.querySelector('#np_cancel').onclick = cancelPasswordRecovery;
   return d;
 }
 

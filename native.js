@@ -518,13 +518,65 @@
     }
   });
 
-  // node_modules/@capacitor/local-notifications/dist/esm/web.js
+  // node_modules/@capacitor/app/dist/esm/web.js
   var web_exports = {};
   __export(web_exports, {
+    AppWeb: () => AppWeb
+  });
+  var AppWeb;
+  var init_web = __esm({
+    "node_modules/@capacitor/app/dist/esm/web.js"() {
+      init_dist();
+      AppWeb = class extends WebPlugin {
+        constructor() {
+          super();
+          this.handleVisibilityChange = () => {
+            const data = {
+              isActive: document.hidden !== true
+            };
+            this.notifyListeners("appStateChange", data);
+            if (document.hidden) {
+              this.notifyListeners("pause", null);
+            } else {
+              this.notifyListeners("resume", null);
+            }
+          };
+          document.addEventListener("visibilitychange", this.handleVisibilityChange, false);
+        }
+        exitApp() {
+          throw this.unimplemented("Not implemented on web.");
+        }
+        async getInfo() {
+          throw this.unimplemented("Not implemented on web.");
+        }
+        async getLaunchUrl() {
+          return { url: "" };
+        }
+        async getState() {
+          return { isActive: document.hidden !== true };
+        }
+        async minimizeApp() {
+          throw this.unimplemented("Not implemented on web.");
+        }
+        async toggleBackButtonHandler() {
+          throw this.unimplemented("Not implemented on web.");
+        }
+        async getAppLanguage() {
+          return {
+            value: navigator.language.split("-")[0].toLowerCase()
+          };
+        }
+      };
+    }
+  });
+
+  // node_modules/@capacitor/local-notifications/dist/esm/web.js
+  var web_exports2 = {};
+  __export(web_exports2, {
     LocalNotificationsWeb: () => LocalNotificationsWeb
   });
   var LocalNotificationsWeb;
-  var init_web = __esm({
+  var init_web2 = __esm({
     "node_modules/@capacitor/local-notifications/dist/esm/web.js"() {
       init_dist();
       LocalNotificationsWeb = class extends WebPlugin {
@@ -750,6 +802,12 @@
   // native-entry.js
   init_dist();
 
+  // node_modules/@capacitor/app/dist/esm/index.js
+  init_dist();
+  var App = registerPlugin("App", {
+    web: () => Promise.resolve().then(() => (init_web(), web_exports)).then((m) => new m.AppWeb())
+  });
+
   // node_modules/@capacitor/local-notifications/dist/esm/index.js
   init_dist();
 
@@ -767,7 +825,7 @@
 
   // node_modules/@capacitor/local-notifications/dist/esm/index.js
   var LocalNotifications = registerPlugin("LocalNotifications", {
-    web: () => Promise.resolve().then(() => (init_web(), web_exports)).then((m) => new m.LocalNotificationsWeb())
+    web: () => Promise.resolve().then(() => (init_web2(), web_exports2)).then((m) => new m.LocalNotificationsWeb())
   });
 
   // node_modules/@capacitor/push-notifications/dist/esm/index.js
@@ -828,6 +886,27 @@
   }
   window.PresencerNative = {
     isNative: Capacitor.isNativePlatform(),
+    /* ---------------- link che aprono l'app ----------------
+       Oggi serve solo al recupero password: Supabase rimanda a
+       it.presencer.app://recovery#access_token=... e Android consegna
+       quell'indirizzo qui. Se l'app era chiusa lo si trova gia' pronto in
+       getLaunchUrl; se era gia' aperta arriva con l'evento appUrlOpen. */
+    async getLaunchUrl() {
+      if (!Capacitor.isNativePlatform()) return null;
+      try {
+        const result = await App.getLaunchUrl();
+        return result && result.url ? result.url : null;
+      } catch (err) {
+        console.warn("Indirizzo di avvio non disponibile", err);
+        return null;
+      }
+    },
+    onAppUrlOpen(handler) {
+      if (!Capacitor.isNativePlatform()) return;
+      App.addListener("appUrlOpen", (event) => {
+        if (event && event.url) handler(event.url);
+      }).catch((err) => console.warn("Ascolto dei link non attivo", err));
+    },
     async checkPermission() {
       if (!Capacitor.isNativePlatform()) return "unavailable";
       const result = await LocalNotifications.checkPermissions();

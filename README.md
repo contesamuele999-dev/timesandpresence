@@ -29,6 +29,25 @@ window.SUPABASE_ANON_KEY = 'eyJ...';
 
 Salva. Fatto: l'app è pronta.
 
+### Recupero password
+
+Il link "Password dimenticata?" usa l'email di recupero che Supabase spedisce già di serie. Perché il
+link riporti nel posto giusto va detto a Supabase dove può rimandare: su **Authentication → URL
+Configuration → Redirect URLs** aggiungi entrambe queste voci.
+
+| Indirizzo da aggiungere | A cosa serve |
+| --- | --- |
+| `https://tuonome.github.io/presencer/` (il tuo) | versione web: il link apre la pagina dell'app |
+| `it.presencer.app://recovery` | APK: il link riapre l'app Android invece del browser |
+
+Senza queste voci Supabase rifiuta il rimando e il link riporta al Site URL del progetto.
+
+Sul web l'app usa da sola l'indirizzo da cui è stata aperta; se serve forzarne un altro (per esempio
+perché apri l'app da più domini) c'è `window.APP_URL` in [`config.js`](config.js). L'APK non usa quel
+valore: lo schema `it.presencer.app://` è già dichiarato nel manifest Android.
+
+Chi apre il link atterra sulla schermata "Nuova password", la imposta ed entra direttamente.
+
 ## 3. Avvio
 
 Serve un piccolo server statico (per motivi di sicurezza il browser non apre `fetch` da `file://`):
@@ -162,6 +181,12 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 - **Installa come app (PWA)**: quando il browser lo permette (Android/Chrome/Edge) compare in basso un
   pulsante "Installa"; su iPhone/iPad (Safari) il pulsante mostra le istruzioni per "Aggiungi a schermata
   Home". Il pulsante si può chiudere con ✕ e non ricompare più su quel dispositivo.
+- **Password dimenticata**: dalla schermata di accesso si chiede il link di recupero via email (l'app
+  non rivela mai se quell'indirizzo è registrato). Il link riporta sull'app, che mostra la schermata
+  "Nuova password" invece di entrare: scelta la password si accede subito. Funziona sia sul web sia
+  nell'APK, che si riapre da sé grazie allo schema `it.presencer.app://recovery` (deep link). Se il
+  link è scaduto o già usato, la schermata di accesso lo spiega e invita a richiederne un altro.
+  Vedi "Recupero password" al punto 2 per la configurazione.
 - **Ricordami**: nella schermata di accesso c'è la spunta "Ricordami su questo dispositivo" (attiva di
   default). Se disattivata, la sessione resta solo finché il browser è aperto (sessionStorage) e non
   persiste alla chiusura.

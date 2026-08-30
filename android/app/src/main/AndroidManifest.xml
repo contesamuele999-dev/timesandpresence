@@ -22,6 +22,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- Recupero password: Supabase rimanda a it.presencer.app://recovery#...
+                 e Android riapre l'app invece del browser. Lo stesso indirizzo va
+                 aggiunto ai Redirect URLs del progetto Supabase. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="it.presencer.app" android:host="recovery" />
+            </intent-filter>
+
         </activity>
 
         <provider

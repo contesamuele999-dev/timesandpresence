@@ -1,4 +1,5 @@
 import { Capacitor } from '@capacitor/core';
+import { App } from '@capacitor/app';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { PushNotifications } from '@capacitor/push-notifications';
 
@@ -67,6 +68,27 @@ function ensurePushListeners(){
 
 window.PresencerNative = {
   isNative: Capacitor.isNativePlatform(),
+  /* ---------------- link che aprono l'app ----------------
+     Oggi serve solo al recupero password: Supabase rimanda a
+     it.presencer.app://recovery#access_token=... e Android consegna
+     quell'indirizzo qui. Se l'app era chiusa lo si trova gia' pronto in
+     getLaunchUrl; se era gia' aperta arriva con l'evento appUrlOpen. */
+  async getLaunchUrl(){
+    if(!Capacitor.isNativePlatform()) return null;
+    try{
+      const result = await App.getLaunchUrl();
+      return result && result.url ? result.url : null;
+    }catch(err){
+      console.warn('Indirizzo di avvio non disponibile', err);
+      return null;
+    }
+  },
+  onAppUrlOpen(handler){
+    if(!Capacitor.isNativePlatform()) return;
+    App.addListener('appUrlOpen', event=>{
+      if(event && event.url) handler(event.url);
+    }).catch(err=> console.warn('Ascolto dei link non attivo', err));
+  },
   async checkPermission(){
     if(!Capacitor.isNativePlatform()) return 'unavailable';
     const result = await LocalNotifications.checkPermissions();
