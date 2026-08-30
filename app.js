@@ -81,6 +81,15 @@ let deferredInstallPrompt = null;
 let installPopupShown = false;
 let rememberMe = localStorage.getItem('rememberMe') !== '0'; // default: sì, ricordami
 
+// Guardie per il flusso di autenticazione:
+// - authFlowBusy: registrazione/join in corso (la sessione arriva PRIMA che
+//   profilo e spazio esistano, l'ascoltatore non deve intromettersi)
+// - signInBusy: caricamento post-login già in corso (evita doppi caricamenti)
+// - authWatchdog: sblocca il pulsante se la risposta non arriva mai
+let authFlowBusy = false;
+let signInBusy = false;
+let authWatchdog = null;
+
 // storage per la sessione Supabase: se "ricordami" è attivo usa localStorage (persiste alla
 // chiusura del browser), altrimenti sessionStorage (sparisce a fine sessione). In lettura
 // controlla entrambi così il reload funziona in ogni caso.
@@ -569,6 +578,13 @@ function boot(){
   if(!window.SUPABASE_URL || window.SUPABASE_URL.indexOf('INCOLLA_QUI') === 0){
     S.view='setup'; render(); return;
   }
+  // La libreria Supabase arriva dalla CDN: se la rete manca al primo avvio
+  // window.supabase non esiste e l'app resterebbe su schermata bianca.
+  if(!window.supabase || !window.supabase.createClient){
+    S.view='setup';
+    S.setupMsg = 'Non riesco a caricare i componenti dell\'app. Controlla la connessione a internet e riapri Presencer.';
+    render(); return;
+  }
   sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
     auth: { persistSession:true, autoRefreshToken:true, detectSessionInUrl:true, storage: authStorage }
   });
@@ -587,34 +603,88 @@ function boot(){
   }
 
   sb.auth.onAuthStateChange((event, session)=>{
-    if(event==='TOKEN_REFRESHED' || event==='USER_UPDATED') { S.session=session; return; }
-    if(event==='SIGNED_OUT'){
-      if(notificationChannel) sb.removeChannel(notificationChannel).catch(()=>{});
-      notificationChannel = null;
-      S.session=null; S.profile=null; S.workspace=null; S.view='auth'; render(); return;
-    }
-    if(session && (!S.session || S.session.user.id!==session.user.id)){
-      S.session=session; handleSignedIn();
-    }
+    // supabase-js invoca questo callback mentre tiene il lock interno sull'auth:
+    // chiamarci dentro altre API (sb.from, getSession...) può bloccare tutto a
+    // tempo indeterminato. Rimandiamo il lavoro fuori dal callback.
+    setTimeout(()=> onAuthEvent(event, session), 0);
   });
 
   sb.auth.getSession().then(({data})=>{
-    if(data.session){ S.session=data.session; handleSignedIn(); }
-    else { S.view='auth'; render(); }
+    if(authFlowBusy) return;                 // registrazione in corso: la gestisce lei
+    if(data && data.session) startSession(data.session);
+    else if(S.view==='loading'){ S.view='auth'; render(); }
+  }).catch(err=>{
+    console.error(err);
+    if(S.view==='loading'){
+      S.view='auth';
+      S.authErr = 'Non riesco a contattare il server. Controlla la connessione e riprova.';
+      render();
+    }
   });
 }
 
+/* Eventi di autenticazione, eseguiti fuori dal lock di supabase-js */
+function onAuthEvent(event, session){
+  if(event==='TOKEN_REFRESHED' || event==='USER_UPDATED'){ if(session) S.session=session; return; }
+  if(event==='SIGNED_OUT'){
+    clearAuthWatchdog();
+    if(notificationChannel) sb.removeChannel(notificationChannel).catch(()=>{});
+    notificationChannel = null;
+    S.session=null; S.profile=null; S.workspace=null; S.myProfiles=[]; S.myWorkspaces=[];
+    S.busy=false; S.view='auth'; render(); return;
+  }
+  // Durante registrazione/join la sessione arriva mentre profilo e spazio non
+  // esistono ancora: entrare qui mostrerebbe "Profilo non trovato" a caso.
+  if(authFlowBusy){ if(session) S.session = session; return; }
+  if(session) startSession(session);
+}
+
+/* Avvia il caricamento post-login, una sola volta per sessione */
+function startSession(session){
+  const same = S.session && S.session.user.id === session.user.id;
+  S.session = session;
+  if(same && (signInBusy || S.view==='app' || S.view==='no-workspace')) return;
+  handleSignedIn();
+}
+
+function armAuthWatchdog(msg){
+  clearAuthWatchdog();
+  authWatchdog = setTimeout(()=>{
+    authWatchdog = null;
+    if(S.view==='auth' || S.view==='loading'){
+      S.busy=false; signInBusy=false; authFlowBusy=false;
+      S.view='auth'; S.authErr = msg; render();
+    }
+  }, 25000);
+}
+
+function clearAuthWatchdog(){
+  if(authWatchdog){ clearTimeout(authWatchdog); authWatchdog = null; }
+}
+
 async function handleSignedIn(){
+  if(signInBusy) return;
+  signInBusy = true;
   try{
     const uid = S.session.user.id;
     await loadMyProfiles();
-    if(!S.myProfiles.length){ S.view='auth'; S.authErr='Profilo non trovato. Contatta chi gestisce lo spazio.'; render(); return; }
+    if(!S.myProfiles.length){
+      // Account valido ma senza profilo (di solito una registrazione interrotta
+      // a metà): invece di un vicolo cieco offriamo di creare o raggiungere uno spazio.
+      clearAuthWatchdog();
+      S.busy=false; S.authErr=''; S.view='no-workspace'; render(); return;
+    }
     const remembered = localStorage.getItem('activeWs_'+uid);
     const chosen = S.myProfiles.find(p=>p.workspace_id===remembered) || S.myProfiles[0];
     await activateProfile(chosen, 'login');
   }catch(err){
     console.error(err);
-    S.view='auth'; S.authErr='Errore di caricamento. Riprova.'; render();
+    clearAuthWatchdog();
+    S.busy=false; S.view='auth';
+    S.authErr = authErrorMessage(err, 'Errore di caricamento. Riprova.');
+    render();
+  }finally{
+    signInBusy = false;
   }
 }
 
@@ -635,7 +705,16 @@ async function loadMyProfiles(){
 async function activateProfile(prof, reason){
   S.profile = prof;
   const {data:ws, error} = await sb.from('workspaces').select('*').eq('id', prof.workspace_id).maybeSingle();
-  if(error){ toast('Errore caricamento spazio.'); return; }
+  if(error || !ws){
+    // Senza spazio non c'è nulla da mostrare: non lasciamo l'accesso appeso.
+    console.error(error);
+    if(S.view!=='app'){
+      authFail(authErrorMessage(error, 'Non riesco a caricare il tuo spazio. Controlla la connessione e riprova.'));
+    } else {
+      toast('Errore caricamento spazio.');
+    }
+    return;
+  }
   S.workspace = ws;
   S.weekOffset = 0;
   S.selectedCalendarOverrideId = null;
@@ -643,6 +722,9 @@ async function activateProfile(prof, reason){
   S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.lessonLogs = []; S.instructors = []; S.guestLinks = [];
   S.dataError = null; S.weekLoadFailed = false; S.presenceNeedsRefresh = false;
   localStorage.setItem('activeWs_'+S.session.user.id, prof.workspace_id);
+  clearAuthWatchdog();
+  S.busy = false;
+  S.authErr = '';
   S.view='app';
   render();
   await loadCalendars();
@@ -702,49 +784,174 @@ function guestLogout(){
 }
 
 /* ---------------- auth actions ---------------- */
+
+/* Normalizza l'email: le tastiere mobili mettono spesso la maiuscola iniziale
+   o uno spazio finale, e l'accesso fallirebbe senza motivo apparente. */
+function cleanEmail(email){ return (email||'').trim().toLowerCase(); }
+
+/* Controlli lato client: meglio un messaggio preciso subito che un errore
+   generico del server. Ritorna il messaggio d'errore, o '' se va tutto bene. */
+function validateCredentials(email, password){
+  if(!email) return 'Inserisci la tua email.';
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'L\'indirizzo email non sembra valido.';
+  if(!password) return 'Inserisci la password.';
+  return '';
+}
+
+/* Traduce gli errori di Supabase in frasi comprensibili */
+function authErrorMessage(error, fallback){
+  const msg = ((error && error.message) || '').toLowerCase();
+  const status = error && error.status;
+  if(!navigator.onLine || msg.includes('failed to fetch') || msg.includes('networkerror') || msg.includes('network request failed'))
+    return 'Nessuna connessione a internet. Riprova quando sei online.';
+  if(msg.includes('invalid login credentials')) return 'Email o password non corretti.';
+  if(msg.includes('email not confirmed')) return 'Devi prima confermare l\'email: controlla la posta (anche lo spam).';
+  if(msg.includes('already registered') || msg.includes('already been registered') || msg.includes('user already'))
+    return 'Email già registrata: usa "Accedi".';
+  if(msg.includes('password should be at least') || msg.includes('weak password'))
+    return 'La password deve avere almeno 6 caratteri.';
+  if(status===429 || msg.includes('rate limit') || msg.includes('security purposes') || msg.includes('too many'))
+    return 'Troppi tentativi ravvicinati. Aspetta un minuto e riprova.';
+  if(msg.includes('invalid email') || msg.includes('unable to validate email'))
+    return 'L\'indirizzo email non sembra valido.';
+  if(msg.includes('signups not allowed') || msg.includes('signup is disabled'))
+    return 'Le registrazioni sono disattivate su questo spazio. Chiedi un codice invito all\'amministratore.';
+  return fallback;
+}
+
 async function doLogin(email, password){
+  if(S.busy) return;                                    // niente doppi invii
+  email = cleanEmail(email);
+  const bad = validateCredentials(email, password);
+  if(bad){ S.authErr = bad; render(); return; }
+
   S.busy=true; S.authErr=''; render();
-  const {error} = await sb.auth.signInWithPassword({email, password});
-  S.busy=false;
-  if(error){ S.authErr = 'Accesso non riuscito: controlla email e password.'; render(); }
+  armAuthWatchdog('Accesso lento o interrotto. Controlla la connessione e riprova.');
+  let error = null;
+  try{
+    ({error} = await sb.auth.signInWithPassword({email, password}));
+  }catch(err){ error = err; }
+  if(error){
+    clearAuthWatchdog();
+    S.busy=false;
+    S.authErr = authErrorMessage(error, 'Accesso non riuscito: controlla email e password.');
+    render(); return;
+  }
+  // Da qui prosegue onAuthEvent → handleSignedIn: teniamo il pulsante su
+  // "Attendere..." finché il profilo non è caricato (o scatta il watchdog).
 }
 
 async function doRegisterWorkspace(name, wsName, email, password){
-  S.busy=true; S.authErr=''; render();
-  const {data, error} = await sb.auth.signUp({email, password});
-  if(error){ S.busy=false; S.authErr = error.message.includes('already') ? 'Email già registrata.' : 'Registrazione non riuscita.'; render(); return; }
-  if(!data.session){
-    S.busy=false;
-    S.authTab='login';
-    S.authErr = 'Account creato! Se richiesta, conferma la mail poi accedi. Se il tuo spazio richiede conferma email, chiedi all\'amministratore di disattivarla nelle impostazioni Supabase per un accesso più semplice.';
-    render(); return;
+  if(S.busy) return;
+  email = cleanEmail(email);
+  if(!name){ S.authErr='Inserisci il tuo nome.'; render(); return; }
+  if(!wsName){ S.authErr='Dai un nome al tuo spazio.'; render(); return; }
+  const bad = validateCredentials(email, password);
+  if(bad){ S.authErr = bad; render(); return; }
+  if(password.length < 6){ S.authErr='La password deve avere almeno 6 caratteri.'; render(); return; }
+
+  S.busy=true; S.authErr=''; authFlowBusy=true; render();
+  armAuthWatchdog('Registrazione lenta o interrotta. Controlla la connessione e riprova.');
+  try{
+    const {data, error} = await sb.auth.signUp({email, password});
+    if(error){ return authFail(authErrorMessage(error, 'Registrazione non riuscita.')); }
+    // Con la conferma email attiva, Supabase non segnala le email già usate:
+    // restituisce un utente senza identità collegate.
+    if(data.user && Array.isArray(data.user.identities) && data.user.identities.length===0){
+      S.authTab='login';
+      return authFail('Email già registrata: usa "Accedi".');
+    }
+    if(!data.session){
+      S.authTab='login';
+      return authFail('Account creato! Conferma la mail e poi accedi. (Per un accesso più semplice, l\'amministratore può disattivare la conferma email nelle impostazioni Supabase.)');
+    }
+    S.session = data.session;
+
+    const code = genCode(6);
+    const {data:ws, error:e2} = await sb.from('workspaces').insert({name: wsName, invite_code: code}).select().single();
+    if(e2){ console.error(e2); return authFail(authErrorMessage(e2, 'Account creato, ma non sono riuscito a creare lo spazio. Riprova ad accedere.')); }
+
+    const e3 = await insertProfileWithRetry({user_id: data.session.user.id, workspace_id: ws.id, name, role:'admin'});
+    if(e3){ console.error(e3); return authFail(authErrorMessage(e3, 'Spazio creato, ma non sono riuscito a creare il tuo profilo. Accedi e riprova.')); }
+
+    authFlowBusy = false;
+    await handleSignedIn();
+  }catch(err){
+    console.error(err);
+    return authFail(authErrorMessage(err, 'Registrazione non riuscita.'));
+  }finally{
+    authFlowBusy = false;
   }
-  S.session = data.session;
-  const code = genCode(6);
-  const {data:ws, error:e2} = await sb.from('workspaces').insert({name: wsName, invite_code: code}).select().single();
-  if(e2){ S.busy=false; S.authErr='Errore creazione spazio.'; render(); return; }
-  const {error:e3} = await sb.from('profiles').insert({user_id: data.session.user.id, workspace_id: ws.id, name, role:'admin'});
-  S.busy=false;
-  if(e3){ S.authErr='Errore creazione profilo.'; render(); return; }
-  await handleSignedIn();
 }
 
 async function doJoin(name, code, email, password){
-  S.busy=true; S.authErr=''; render();
-  const {data:ws, error:e1} = await sb.from('workspaces').select('*').eq('invite_code', code.trim().toUpperCase()).maybeSingle();
-  if(e1 || !ws){ S.busy=false; S.authErr='Codice invito non valido.'; render(); return; }
-  const {data, error} = await sb.auth.signUp({email, password});
-  if(error){ S.busy=false; S.authErr = error.message.includes('already') ? 'Email già registrata.' : 'Registrazione non riuscita.'; render(); return; }
-  if(!data.session){
-    S.busy=false; S.authTab='login';
-    S.authErr = 'Account creato! Conferma la mail (se richiesto) poi accedi.';
-    render(); return;
+  if(S.busy) return;
+  email = cleanEmail(email);
+  if(!name){ S.authErr='Inserisci il tuo nome.'; render(); return; }
+  if(!code || !code.trim()){ S.authErr='Inserisci il codice invito.'; render(); return; }
+  const bad = validateCredentials(email, password);
+  if(bad){ S.authErr = bad; render(); return; }
+  if(password.length < 6){ S.authErr='La password deve avere almeno 6 caratteri.'; render(); return; }
+
+  S.busy=true; S.authErr=''; authFlowBusy=true; render();
+  armAuthWatchdog('Registrazione lenta o interrotta. Controlla la connessione e riprova.');
+  try{
+    const {data:ws, error:e1} = await sb.from('workspaces').select('*').eq('invite_code', code.trim().toUpperCase()).maybeSingle();
+    if(e1){ console.error(e1); return authFail(authErrorMessage(e1, 'Non riesco a verificare il codice. Riprova.')); }
+    if(!ws){ return authFail('Codice invito non valido.'); }
+
+    const {data, error} = await sb.auth.signUp({email, password});
+    if(error){
+      // Chi ha già un account deve accedere e poi usare il codice dal profilo.
+      const m = authErrorMessage(error, 'Registrazione non riuscita.');
+      if(m.indexOf('già registrata')>=0){
+        S.authTab='login';
+        return authFail('Email già registrata: accedi, poi usa il codice invito dal menu in alto per entrare nello spazio.');
+      }
+      return authFail(m);
+    }
+    if(data.user && Array.isArray(data.user.identities) && data.user.identities.length===0){
+      S.authTab='login';
+      return authFail('Email già registrata: accedi, poi usa il codice invito dal menu in alto per entrare nello spazio.');
+    }
+    if(!data.session){
+      S.authTab='login';
+      return authFail('Account creato! Conferma la mail e poi accedi.');
+    }
+    S.session = data.session;
+
+    const e3 = await insertProfileWithRetry({user_id: data.session.user.id, workspace_id: ws.id, name, role:'instructor'});
+    if(e3){ console.error(e3); return authFail(authErrorMessage(e3, 'Account creato, ma non sono riuscito a entrare nello spazio. Accedi e riprova con il codice.')); }
+
+    authFlowBusy = false;
+    await handleSignedIn();
+  }catch(err){
+    console.error(err);
+    return authFail(authErrorMessage(err, 'Registrazione non riuscita.'));
+  }finally{
+    authFlowBusy = false;
   }
-  S.session = data.session;
-  const {error:e3} = await sb.from('profiles').insert({user_id: data.session.user.id, workspace_id: ws.id, name, role:'instructor'});
-  S.busy=false;
-  if(e3){ S.authErr='Errore creazione profilo.'; render(); return; }
-  await handleSignedIn();
+}
+
+/* Mostra l'errore e rimette la schermata di accesso in uno stato pulito */
+function authFail(message){
+  clearAuthWatchdog();
+  authFlowBusy = false;
+  S.busy = false;
+  S.authErr = message;
+  S.view = 'auth';
+  render();
+}
+
+/* L'inserimento del profilo può fallire per un intoppo di rete proprio mentre
+   il token appena creato viene propagato: un secondo tentativo salva la sessione. */
+async function insertProfileWithRetry(row){
+  let {error} = await sb.from('profiles').insert(row);
+  if(!error || error.code==='23505') return null;   // 23505 = profilo già presente
+  await new Promise(r=>setTimeout(r, 700));
+  ({error} = await sb.from('profiles').insert(row));
+  if(error && error.code==='23505') return null;
+  return error || null;
 }
 
 /* ---------------- gestione più spazi per lo stesso account ---------------- */
@@ -821,8 +1028,11 @@ async function doLogout(){
     try{ await sb.removeChannel(notificationChannel); }catch(e){}
     notificationChannel = null;
   }
-  await sb.auth.signOut();
-  S.profile=null; S.workspace=null; S.view='auth'; S.tab='presenze';
+  // Se il token è già scaduto signOut può fallire: l'uscita deve comunque riuscire.
+  try{ await sb.auth.signOut(); }catch(e){ console.error(e); }
+  clearAuthWatchdog();
+  S.session=null; S.profile=null; S.workspace=null; S.myProfiles=[]; S.myWorkspaces=[];
+  S.busy=false; S.authErr=''; S.view='auth'; S.tab='presenze';
   render();
 }
 
@@ -1313,6 +1523,20 @@ async function createFirstWorkspaceAfterOrphan(personName, wsName){
   await activateProfile(prof, 'created');
 }
 
+/* Account senza profilo (registrazione interrotta): entra con un codice invito */
+async function joinWorkspaceAfterOrphan(personName, code){
+  if(!personName || !code){ toast('Inserisci nome e codice.'); return; }
+  const {data:ws, error} = await sb.from('workspaces').select('*').eq('invite_code', code.trim().toUpperCase()).maybeSingle();
+  if(error || !ws){ toast('Codice invito non valido.'); return; }
+  const e2 = await insertProfileWithRetry({user_id:S.session.user.id, workspace_id:ws.id, name:personName, role:'instructor'});
+  if(e2){ toast('Errore creazione profilo.'); return; }
+  const {data:prof, error:e3} = await sb.from('profiles').select('*').eq('user_id', S.session.user.id).eq('workspace_id', ws.id).single();
+  if(e3){ toast('Errore lettura profilo.'); return; }
+  S.myProfiles = [prof];
+  S.myWorkspaces = [{id:ws.id, name:ws.name}];
+  await activateProfile(prof, 'joined');
+}
+
 async function regenerateInviteCode(){
   const code = genCode(6);
   const {error} = await sb.from('workspaces').update({invite_code:code}).eq('id', S.workspace.id);
@@ -1391,16 +1615,29 @@ function renderNoWorkspace(){
   d.className = 'authwrap';
   d.innerHTML = `
     <div class="authbox">
-      <div class="logo"><div class="mark">📋</div><h1>Nessuno spazio</h1><p>Crea un nuovo spazio per continuare a usare l'app.</p></div>
+      <div class="logo"><div class="mark">📋</div><h1>Nessuno spazio</h1><p>Il tuo account funziona, ma non è collegato a nessuno spazio. Creane uno o entra con un codice invito.</p></div>
       <div class="card">
-        <label class="field"><span>Il tuo nome</span><input type="text" id="nw_name2"></label>
-        <label class="field"><span>Nome dello spazio</span><input type="text" id="nw_ws2"></label>
-        <button class="btn block" id="nw_go2">Crea</button>
+        <form id="nw_form">
+          <label class="field"><span>Il tuo nome</span><input type="text" autocomplete="name" id="nw_name2"></label>
+          <label class="field"><span>Nome dello spazio</span><input type="text" id="nw_ws2"></label>
+          <button type="submit" class="btn block" id="nw_go2">Crea spazio</button>
+        </form>
+        <form id="nw_join" style="margin-top:18px;border-top:1px solid rgba(0,0,0,.08);padding-top:14px">
+          <label class="field"><span>Oppure entra con un codice invito</span><input type="text" id="nw_code2" autocapitalize="characters" autocomplete="off" spellcheck="false" style="text-transform:uppercase"></label>
+          <button type="submit" class="btn secondary block">Entra nello spazio</button>
+        </form>
         <button class="btn ghost block" id="nw_out2" style="margin-top:8px">Esci</button>
       </div>
     </div>`;
-  d.querySelector('#nw_go2').onclick = ()=> createFirstWorkspaceAfterOrphan(
-    d.querySelector('#nw_name2').value.trim(), d.querySelector('#nw_ws2').value.trim());
+  const name2 = ()=> d.querySelector('#nw_name2').value.trim();
+  d.querySelector('#nw_form').onsubmit = (e)=>{
+    e.preventDefault();
+    createFirstWorkspaceAfterOrphan(name2(), d.querySelector('#nw_ws2').value.trim());
+  };
+  d.querySelector('#nw_join').onsubmit = (e)=>{
+    e.preventDefault();
+    joinWorkspaceAfterOrphan(name2(), d.querySelector('#nw_code2').value.trim());
+  };
   d.querySelector('#nw_out2').onclick = doLogout;
   return d;
 }
@@ -1453,46 +1690,57 @@ function renderAuth(){
           <button data-t="register" class="${tab==='register'?'active':''}">Crea spazio</button>
           <button data-t="join" class="${tab==='join'?'active':''}">Ho un codice</button>
         </div>
-        ${S.authErr ? `<div class="errbox">${esc(S.authErr)}</div>` : ''}
-        <div id="authform"></div>
+        ${S.authErr ? `<div class="errbox" role="alert">${esc(S.authErr)}</div>` : ''}
+        <form id="authform" novalidate></form>
       </div>
     </div>`;
   d.querySelectorAll('.authtabs button').forEach(b=> b.onclick = ()=>{ S.authTab=b.dataset.t; S.authErr=''; render(); });
 
+  // Campi email: niente maiuscola automatica né correttore, altrimenti sulle
+  // tastiere mobili l'indirizzo arriva sporcato e l'accesso fallisce.
+  const emailAttrs = 'type="email" inputmode="email" autocomplete="email" autocapitalize="none" autocorrect="off" spellcheck="false"';
   const form = d.querySelector('#authform');
   if(tab==='login'){
     form.innerHTML = `
-      <label class="field"><span>Email</span><input type="email" id="a_email"></label>
-      <label class="field"><span>Password</span><input type="password" id="a_pass"></label>
+      <label class="field"><span>Email</span><input ${emailAttrs} id="a_email"></label>
+      <label class="field"><span>Password</span><input type="password" autocomplete="current-password" id="a_pass"></label>
       <label class="checkrow"><input type="checkbox" id="a_remember" ${rememberMe?'checked':''}><span>Ricordami su questo dispositivo</span></label>
-      <button class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Accedi'}</button>`;
-    form.querySelector('#a_go').onclick = ()=>{
-      rememberMe = form.querySelector('#a_remember').checked;
-      localStorage.setItem('rememberMe', rememberMe?'1':'0');
-      doLogin(form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
-    };
+      <button type="submit" class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Accedi'}</button>`;
   } else if(tab==='register'){
     form.innerHTML = `
-      <label class="field"><span>Il tuo nome</span><input type="text" id="a_name"></label>
+      <label class="field"><span>Il tuo nome</span><input type="text" autocomplete="name" id="a_name"></label>
       <label class="field"><span>Nome dello spazio (palestra, azienda, famiglia...)</span><input type="text" id="a_ws"></label>
-      <label class="field"><span>Email</span><input type="email" id="a_email"></label>
-      <label class="field"><span>Password</span><input type="password" id="a_pass"></label>
-      <button class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Crea il mio spazio'}</button>
-      <p class="hint">Diventerai amministratore e potrai invitare gli altri con un codice.</p>`;
-    form.querySelector('#a_go').onclick = ()=> doRegisterWorkspace(
-      form.querySelector('#a_name').value.trim(), form.querySelector('#a_ws').value.trim(),
-      form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
+      <label class="field"><span>Email</span><input ${emailAttrs} id="a_email"></label>
+      <label class="field"><span>Password</span><input type="password" autocomplete="new-password" id="a_pass"></label>
+      <button type="submit" class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Crea il mio spazio'}</button>
+      <p class="hint">Almeno 6 caratteri. Diventerai amministratore e potrai invitare gli altri con un codice.</p>`;
   } else {
     form.innerHTML = `
-      <label class="field"><span>Il tuo nome</span><input type="text" id="a_name"></label>
-      <label class="field"><span>Codice invito</span><input type="text" id="a_code" style="text-transform:uppercase"></label>
-      <label class="field"><span>Email</span><input type="email" id="a_email"></label>
-      <label class="field"><span>Password</span><input type="password" id="a_pass"></label>
-      <button class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Entra nello spazio'}</button>`;
-    form.querySelector('#a_go').onclick = ()=> doJoin(
-      form.querySelector('#a_name').value.trim(), form.querySelector('#a_code').value.trim(),
-      form.querySelector('#a_email').value.trim(), form.querySelector('#a_pass').value);
+      <label class="field"><span>Il tuo nome</span><input type="text" autocomplete="name" id="a_name"></label>
+      <label class="field"><span>Codice invito</span><input type="text" id="a_code" autocapitalize="characters" autocomplete="off" spellcheck="false" style="text-transform:uppercase"></label>
+      <label class="field"><span>Email</span><input ${emailAttrs} id="a_email"></label>
+      <label class="field"><span>Password</span><input type="password" autocomplete="new-password" id="a_pass"></label>
+      <button type="submit" class="btn block" id="a_go" ${S.busy?'disabled':''}>${S.busy?'Attendere...':'Entra nello spazio'}</button>
+      <p class="hint">La password deve avere almeno 6 caratteri.</p>`;
   }
+
+  // Un vero <form>: così l'invio da tastiera (Enter / tasto "Vai" del telefono)
+  // dal campo password funziona come il tocco sul pulsante.
+  const val = id => { const el = form.querySelector(id); return el ? el.value : ''; };
+  form.onsubmit = (e)=>{
+    e.preventDefault();
+    if(S.busy) return;
+    if(tab==='login'){
+      const rem = form.querySelector('#a_remember');
+      rememberMe = rem ? rem.checked : rememberMe;
+      localStorage.setItem('rememberMe', rememberMe?'1':'0');
+      doLogin(val('#a_email'), val('#a_pass'));
+    } else if(tab==='register'){
+      doRegisterWorkspace(val('#a_name').trim(), val('#a_ws').trim(), val('#a_email'), val('#a_pass'));
+    } else {
+      doJoin(val('#a_name').trim(), val('#a_code').trim(), val('#a_email'), val('#a_pass'));
+    }
+  };
   const im = installMode();
   if(im) d.appendChild(renderInstallBar(im, false));
   return d;

@@ -1,4 +1,7 @@
-const CACHE = 'presencer-v6';
+const CACHE = 'presencer-v7';
+// La libreria Supabase sta su CDN: senza copia in cache, un avvio senza rete
+// (o con rete lenta) lascia l'app senza login e con la schermata vuota.
+const VENDOR = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
 const ASSETS = [
   './',
   './index.html',
@@ -12,7 +15,9 @@ const ASSETS = [
 
 self.addEventListener('install', e => {
   e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())
+    caches.open(CACHE)
+      .then(c => c.addAll(ASSETS).then(() => c.add(VENDOR).catch(() => {})))
+      .then(() => self.skipWaiting())
   );
 });
 
@@ -27,7 +32,22 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
-  if (url.origin !== location.origin) return; // lascia passare le chiamate a Supabase
+  if (url.origin !== location.origin) {
+    // La libreria da CDN: prima la cache (avvio immediato e funzionante offline),
+    // aggiornandola in background. Tutto il resto (API Supabase) passa diretto.
+    if (e.request.url === VENDOR) {
+      e.respondWith(
+        caches.match(e.request).then(hit => {
+          const net = fetch(e.request).then(res => {
+            if (res && res.ok) caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+            return res;
+          }).catch(() => hit);
+          return hit || net;
+        })
+      );
+    }
+    return;
+  }
 
   // network-first: quando c'è connessione usa sempre la versione più recente
   // (offline, o rete lenta, torna alla copia in cache così l'app resta usabile)
