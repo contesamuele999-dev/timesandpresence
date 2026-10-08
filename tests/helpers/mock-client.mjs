@@ -8,6 +8,7 @@ export function mockClient(respond) {
         select(columns = '*') { request.columns = columns; return query; },
         insert(payload) { request.operation = 'insert'; request.payload = payload; return query; },
         update(payload) { request.operation = 'update'; request.payload = payload; return query; },
+        upsert(payload) { request.operation = 'upsert'; request.payload = payload; return query; },
         delete() { request.operation = 'delete'; return query; },
         single() { request.single = true; return query; },
         maybeSingle() { request.maybeSingle = true; return query; },

@@ -22,6 +22,7 @@ const NOTIFICATION_TYPES = [
   {id:'calendar', label:'Calendari', description:'Quando cambia un calendario o la sua data di attivazione.'},
   {id:'lesson_log', label:'Registri lezione', description:'Quando viene modificata una voce del registro.'},
   {id:'members', label:'Membri', description:'Quando entra, cambia ruolo o viene rimosso un membro.'},
+  {id:'absence', label:'Richieste di assenza', description:'Quando qualcuno chiede di assentarsi e quando la richiesta viene decisa.'},
 ];
 const DEFAULT_NOTIFICATION_PREFERENCES = {
   enabled:true,   // di serie le notifiche sono attive: manca solo il permesso del dispositivo
@@ -31,7 +32,12 @@ const DEFAULT_NOTIFICATION_PREFERENCES = {
   calendar:true,
   lesson_log:true,
   members:true,
+  absence:true,
 };
+// Regole compensi di serie: in compresenza ognuno prende 2/3 della tariffa, il
+// maestro caposcuola presente prende tutto.
+const DEFAULT_PAY = {default_rate:0, rates:{}, copresence_factor:0.6667, master_takes_all:true};
+const GRADE_LABEL = {istruttore:'Istruttore', maestro:'Maestro caposcuola'};
 
 let sb = null;
 const S = {
@@ -52,7 +58,7 @@ const S = {
   guest: null,          // {token, name, workspace_id, expires_at} quando accesso rapido
   pendingGuestToken: null,
 
-  tab: 'presenze',      // presenze | calendari | istruttori | profilo
+  tab: 'presenze',      // presenze | ore | calendari | istruttori | profilo
   calendars: [],
   calendarPeriods: [],  // [{id, workspace_id, calendar_id, start_date}]
   selectedCalendarId: null, // ID del calendario effettivo per la data visualizzata
@@ -64,6 +70,8 @@ const S = {
   attendance: [],
   recurring: [],
   lessonLogs: [],       // registro lezione: cosa è stato fatto in ogni lezione/data
+  cancellations: [],    // lezioni settimanali annullate in una data precisa
+  absenceRequests: [],  // richieste di assenza (con lezione incorporata)
   showAllMatrix: false,
   matrixFullscreen: false,  // vista Tutti a tutta pagina, senza barre
   presenceSaving: false,
@@ -76,6 +84,16 @@ const S = {
 
   instructors: [],
   guestLinks: [],
+
+  // scheda Ore: periodo, persona filtrata (solo admin) e dati caricati
+  reportMode: 'month',  // week | month | custom
+  reportFrom: '',
+  reportTo: '',
+  reportPerson: '',
+  reportDetail: false,
+  reportData: null,
+  reportLoading: false,
+  paySettings: null,
   backupBusy: false,   // esportazione o ripristino in corso
 
   notificationPreferences: Object.assign({}, DEFAULT_NOTIFICATION_PREFERENCES),
@@ -969,6 +987,7 @@ async function activateProfile(prof, reason){
   S.selectedCalendarOverrideId = null;
   S.tab = 'presenze';
   S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.lessonLogs = []; S.instructors = []; S.guestLinks = [];
+  S.cancellations = []; S.absenceRequests = []; S.reportData = null; S.paySettings = null; S.reportPerson = '';
   S.dataError = null; S.weekLoadFailed = false; S.presenceNeedsRefresh = false;
   localStorage.setItem('activeWs_'+S.session.user.id, prof.workspace_id);
   clearAuthWatchdog();
@@ -1021,7 +1040,7 @@ async function enterGuestApp(){
   S.weekOffset = 0;
   S.selectedCalendarOverrideId = null;
   S.view='app'; S.tab='presenze';
-  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = [];
+  S.calendars = []; S.calendarPeriods = []; S.slots = []; S.extraSlots = []; S.attendance = []; S.recurring = []; S.instructors = []; S.cancellations = []; S.absenceRequests = [];
   render();
   await loadCalendars();
   await loadInstructors();
@@ -1390,18 +1409,44 @@ async function joinAdditionalWorkspace(code){
   await activateProfile(prof, 'joined');
 }
 
+/* Le foto del telefono pesano diversi MB, possono essere HEIC e su Android a volte
+   arrivano senza tipo: le riduciamo a un JPEG quadrato da 512px, leggero e
+   leggibile da ogni browser. */
+async function shrinkImage(file, size=512){
+  const url = URL.createObjectURL(file);
+  try{
+    const img = await new Promise((ok, ko)=>{ const i = new Image(); i.onload = ()=> ok(i); i.onerror = ko; i.src = url; });
+    const side = Math.min(img.naturalWidth, img.naturalHeight);
+    const out = Math.min(size, side);
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = out;
+    canvas.getContext('2d').drawImage(img, (img.naturalWidth-side)/2, (img.naturalHeight-side)/2, side, side, 0, 0, out, out);
+    return await new Promise(ok=> canvas.toBlob(ok, 'image/jpeg', 0.85));
+  }finally{ URL.revokeObjectURL(url); }
+}
+
 async function uploadAvatar(file){
-  if(!file.type.startsWith('image/')){ toast('Scegli un\'immagine.'); return; }
-  if(file.size > 5*1024*1024){ toast('Immagine troppo grande (max 5MB).'); return; }
-  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
-  const path = `${S.session.user.id}/avatar.${ext}`;
+  if(file.type && !file.type.startsWith('image/')){ toast('Scegli un\'immagine.'); return; }
   toast('Caricamento foto...');
-  const {error} = await sb.storage.from('avatars').upload(path, file, {upsert:true, cacheControl:'3600'});
-  if(error){ toast('Errore caricamento foto.'); return; }
+  let blob = null;
+  try{ blob = await shrinkImage(file); }catch(e){ console.warn('Foto non ridimensionata', e); }
+  if(!blob){
+    // formato che il browser non sa aprire (es. HEIC fuori da Safari)
+    toast('Formato immagine non supportato: scegli una foto JPG o PNG.');
+    return;
+  }
+  await refreshSessionIfStale();
+  const path = `${S.session.user.id}/avatar.jpg`;
+  const {error} = await sb.storage.from('avatars').upload(path, blob, {upsert:true, cacheControl:'3600', contentType:'image/jpeg'});
+  if(error){
+    console.error('Presencer: caricamento foto', error);
+    toast('Errore caricamento foto: '+(error.message||'riprova')+'.');
+    return;
+  }
   const {data} = sb.storage.from('avatars').getPublicUrl(path);
   const url = data.publicUrl + '?t=' + Date.now();
   const {error:e2} = await sb.from('profiles').update({avatar_url:url}).eq('user_id', S.session.user.id);
-  if(e2){ toast('Errore salvataggio foto.'); return; }
+  if(e2){ console.error('Presencer: salvataggio foto', e2); toast('Errore salvataggio foto: '+(e2.message||'riprova')+'.'); return; }
   S.profile.avatar_url = url;
   S.myProfiles.forEach(p=>{ if(p.user_id===S.session.user.id) p.avatar_url = url; });
   if(S.instructors.length){
@@ -1494,17 +1539,24 @@ async function refreshWeekData(){
     const slotIds = slots.map(s=>s.id), extraIds = extraSlots.map(s=>s.id);
     const datedRows = (table, column, ids)=> ids.length
       ? checkedRows(sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
-    const [attendance, extraAttendance, recurring, logs, extraLogs] = await Promise.all([
+    // Le richieste partono da oggi anche guardando settimane passate: servono
+    // anche all'elenco di quelle ancora da decidere.
+    const since = from < todayISO() ? from : todayISO();
+    const [attendance, extraAttendance, recurring, logs, extraLogs, cancellations, absenceRequests] = await Promise.all([
       datedRows('attendance', 'slot_id', slotIds),
       datedRows('attendance', 'extra_slot_id', extraIds),
       !guest && slotIds.length ? checkedRows(sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
       guest ? [] : datedRows('lesson_logs', 'slot_id', slotIds),
       guest ? [] : datedRows('lesson_logs', 'extra_slot_id', extraIds),
+      slotIds.length ? softRows(sb.from('lesson_cancellations').select('*').in('slot_id', slotIds).gte('date', from).lte('date', to)) : [],
+      guest ? [] : softRows(sb.from('absence_requests').select('*, slots(label,start_time,end_time), extra_slots(label,start_time,end_time)')
+        .eq('workspace_id', S.workspace.id).gte('date', since).order('date')),
     ]);
     if(!current()) return false;
     // Pubblica una fotografia completa: mai una settimana parziale o la risposta
     // tardiva di una settimana/spazio che l'utente ha già lasciato.
-    Object.assign(S, {slots, extraSlots, recurring, attendance:attendance.concat(extraAttendance), lessonLogs:logs.concat(extraLogs)});
+    Object.assign(S, {slots, extraSlots, recurring, cancellations, absenceRequests,
+      attendance:attendance.concat(extraAttendance), lessonLogs:logs.concat(extraLogs)});
     S.selectedCalendarId = getEffectiveCalendarForWeek(monday);
     S.weekDataContext = context;
     S.weekLoadFailed = false;
@@ -1572,28 +1624,34 @@ function findMyAttendance(ref, dateStr){
   });
 }
 
-function isRecurringFor(slotId, instructorId){
-  return S.recurring.some(r=>r.slot_id===slotId && r.instructor_id===instructorId);
+// ricorrenza ancora attiva (quella che il pulsante 🔁 accende e spegne)
+function activeRecurring(slotId, instructorId){
+  return S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===instructorId && !r.ended_on);
 }
-function isMyRecurring(slotId){ return !isGuest() && isRecurringFor(slotId, myProfileId()); }
-// stato replicato dalla ricorrenza ('presente' | 'assente'), o null se non ricorrente
-function recurringStatusFor(slotId, instructorId){
-  const r = S.recurring.find(x=>x.slot_id===slotId && x.instructor_id===instructorId);
+function isMyRecurring(slotId){ return !isGuest() && !!activeRecurring(slotId, myProfileId()); }
+
+// La ricorrenza vale dalla settimana in cui è stata creata fino a ended_on (escluso):
+// non riempie le settimane precedenti, ma resta nello storico per il conteggio ore.
+function mondayISOOf(value){
+  const d = value ? new Date(value) : new Date();
+  return toISO(new Date(d.getFullYear(), d.getMonth(), d.getDate() - (d.getDay()+6)%7));
+}
+function recurringCovers(r, dateStr){
+  return dateStr >= mondayISOOf(r.created_at) && (!r.ended_on || dateStr < r.ended_on);
+}
+// stato replicato dalla ricorrenza in quella data ('presente' | 'assente'), o null
+function recurringStatusOn(slotId, instructorId, dateStr, recurring=S.recurring){
+  const r = recurring.find(x=>x.slot_id===slotId && x.instructor_id===instructorId && recurringCovers(x, dateStr));
   return r ? (r.status || 'presente') : null;
 }
-function myRecurringStatus(slotId){ return isGuest() ? null : recurringStatusFor(slotId, myProfileId()); }
-
-// la presenza ricorrente vale solo dalla settimana corrente in poi: non deve "riempire"
-// retroattivamente le settimane passate (altrimenti sembra presente fisso ovunque).
-function recurringAppliesOn(dateStr){ return dateStr >= toISO(mondayOf(0)); }
 
 // stato "effettivo" per me su uno slot/data: riga esplicita se c'è, altrimenti presenza
 // implicita se lo slot è marcato come ricorrente (da questa settimana in poi), altrimenti nessuno stato.
 function myAttendanceState(ref, dateStr){
   const row = findMyAttendance(ref, dateStr);
   if(row) return row.status; // 'presente' | 'assente'
-  if(ref.slot_id && recurringAppliesOn(dateStr)){
-    const rs = myRecurringStatus(ref.slot_id);
+  if(ref.slot_id && !isGuest()){
+    const rs = recurringStatusOn(ref.slot_id, myProfileId(), dateStr);
     if(rs) return rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
   }
   return null;
@@ -1685,12 +1743,22 @@ async function cycleAttendance(ref, dateStr){
 async function toggleRecurring(ref, slotId, dateStr){
   if(isGuest()) return;
   return runPresenceWrite('Salvataggio ricorrenza', async ()=>{
-    const existing = S.recurring.find(r=>r.slot_id===slotId && r.instructor_id===myProfileId());
+    const existing = activeRecurring(slotId, myProfileId());
     if(existing){
-      await checkedRow(sb.from('recurring_presence').delete().eq('id', existing.id).select('id'));
+      const thisMonday = toISO(mondayOf(0));
+      // Nata questa settimana: niente storico da conservare, si cancella.
+      if(mondayISOOf(existing.created_at) >= thisMonday){
+        await checkedRow(sb.from('recurring_presence').delete().eq('id', existing.id).select('id'));
+        return ()=>{
+          S.recurring = S.recurring.filter(r=>r.id!==existing.id);
+          toast('Presenza ricorrente disattivata.');
+        };
+      }
+      // Altrimenti si chiude: le settimane passate restano presenti per il conteggio ore.
+      const data = await checkedRow(sb.from('recurring_presence').update({ended_on:thisMonday}).eq('id', existing.id).select());
       return ()=>{
-        S.recurring = S.recurring.filter(r=>r.id!==existing.id);
-        toast('Presenza ricorrente disattivata.');
+        S.recurring = S.recurring.map(r=>r.id===existing.id ? data : r);
+        toast('Presenza ricorrente disattivata da questa settimana.');
       };
     }
     // replica lo stato attualmente impostato su questo orario (presente/assente),
@@ -1729,6 +1797,234 @@ async function deleteExtraSlot(id){
       S.lessonLogs = S.lessonLogs.filter(row=>row.extra_slot_id!==id);
     };
   });
+}
+
+/* ---------------- ore e compensi ---------------- */
+function rateKey(label){ return String(label||'').trim().toLowerCase(); }
+function minutesOf(t){ const [h,m] = String(t||'0:0').split(':').map(Number); return h*60+(m||0); }
+function datesBetween(from, to){
+  const out = [];
+  const [y,m,d] = from.split('-').map(Number);
+  for(let dt = new Date(y, m-1, d); toISO(dt) <= to; dt.setDate(dt.getDate()+1)) out.push(toISO(dt));
+  return out;
+}
+function round2(n){ return Math.round(n*100)/100; }
+function euro(n){ return (n||0).toLocaleString('it-IT', {style:'currency', currency:'EUR'}); }
+function fmtHours(h){ return (h||0).toLocaleString('it-IT', {maximumFractionDigits:2}); }
+
+/* Una riga per persona con ore, lezioni e compenso, più il dettaglio di ogni lezione.
+   Presente = riga "presente", oppure ricorrenza attiva quel giorno senza eccezione.
+   Regole: da solo prende la tariffa piena; in compresenza ognuno prende
+   copresence_factor della tariffa; se c'è un maestro caposcuola (e la regola è attiva)
+   il compenso va solo ai maestri presenti, gli altri contano le ore ma non il compenso. */
+function computePayroll(data, pay, people, calendarFor){
+  pay = Object.assign({}, DEFAULT_PAY, pay||{});
+  const byKey = new Map();
+  const person = (key, name, grade)=>{
+    if(!byKey.has(key)) byKey.set(key, {key, name, grade, hours:0, paidHours:0, amount:0, lessons:0, entries:[]});
+    return byKey.get(key);
+  };
+  people.forEach(p=> person(p.id, p.name, p.grade||'istruttore'));
+  datesBetween(data.from, data.to).forEach(dateStr=>{
+    const [y,m,d] = dateStr.split('-').map(Number);
+    const wd = (new Date(y, m-1, d).getDay()+6)%7;
+    const calId = calendarFor(dateStr);
+    const lessons = data.slots
+      .filter(sl=> sl.calendar_id===calId && sl.weekday===wd && !data.cancellations.some(c=>c.slot_id===sl.id && c.date===dateStr))
+      .map(sl=>({row:sl, ref:{slot_id:sl.id}}))
+      .concat(data.extras.filter(e=> e.date===dateStr).map(e=>({row:e, ref:{extra_slot_id:e.id}})));
+    lessons.forEach(({row, ref})=>{
+      const marks = data.attendance.filter(a=> a.date===dateStr && sameLesson(a, ref));
+      const present = [];
+      marks.forEach(a=>{
+        if(a.status!=='presente') return;
+        if(a.instructor_id) present.push(person(a.instructor_id, 'Membro rimosso', 'istruttore'));
+        else present.push(person('g:'+a.guest_token, (a.guest_name||'Ospite')+' (ospite)', 'istruttore'));
+      });
+      if(ref.slot_id){
+        const seen = new Set(marks.map(a=>a.instructor_id).filter(Boolean));
+        data.recurring.forEach(r=>{
+          if(r.slot_id!==ref.slot_id || seen.has(r.instructor_id) || !byKey.has(r.instructor_id)) return;
+          if(recurringStatusOn(ref.slot_id, r.instructor_id, dateStr, data.recurring)!=='presente') return;
+          seen.add(r.instructor_id);
+          present.push(byKey.get(r.instructor_id));
+        });
+      }
+      if(!present.length) return;
+      const hours = Math.max(0, minutesOf(row.end_time) - minutesOf(row.start_time))/60;
+      const custom = pay.rates[rateKey(row.label)];
+      const rate = custom!=null && custom!=='' ? Number(custom) : Number(pay.default_rate)||0;
+      const masters = pay.master_takes_all ? present.filter(p=> p.grade==='maestro') : [];
+      const paid = masters.length ? masters : present;
+      const share = paid.length>1 ? Number(pay.copresence_factor) : 1;
+      const note = masters.length && present.length>masters.length ? 'con maestro caposcuola'
+        : paid.length>1 ? `compresenza (${paid.length})` : '';
+      present.forEach(p=>{
+        const isPaid = paid.includes(p);
+        const amount = isPaid ? round2(rate*hours*share) : 0;
+        p.hours += hours; p.lessons++; p.amount = round2(p.amount+amount);
+        if(isPaid) p.paidHours += hours;
+        p.entries.push({date:dateStr, label:row.label, start:row.start_time, end:row.end_time, hours, rate, amount, note});
+      });
+    });
+  });
+  return Array.from(byKey.values()).sort((a,b)=> a.name.localeCompare(b.name));
+}
+
+function reportRange(){
+  if(S.reportMode==='custom' && S.reportFrom && S.reportTo) return {from:S.reportFrom, to:S.reportTo};
+  const anchor = S.reportFrom ? S.reportFrom.split('-').map(Number) : null;
+  const base = anchor ? new Date(anchor[0], anchor[1]-1, anchor[2]) : new Date();
+  if(S.reportMode==='week'){
+    const mon = new Date(base.getFullYear(), base.getMonth(), base.getDate()-(base.getDay()+6)%7);
+    return {from:toISO(mon), to:toISO(new Date(mon.getFullYear(), mon.getMonth(), mon.getDate()+6))};
+  }
+  return {from:toISO(new Date(base.getFullYear(), base.getMonth(), 1)), to:toISO(new Date(base.getFullYear(), base.getMonth()+1, 0))};
+}
+function shiftReport(dir){
+  const {from} = reportRange();
+  const [y,m,d] = from.split('-').map(Number);
+  const next = S.reportMode==='week' ? new Date(y, m-1, d+7*dir) : new Date(y, m-1+dir, 1);
+  S.reportFrom = toISO(next);
+  loadReport();
+}
+
+async function loadReport(){
+  if(!S.workspace || isGuest()) return;
+  const wsId = S.workspace.id;
+  const {from, to} = reportRange();
+  const key = [wsId, from, to].join('|');
+  S.reportLoading = true; render();
+  try{
+    if(!S.instructors.length) await loadInstructors();
+    const calIds = S.calendars.map(c=>c.id);
+    const [slots, extras, settings] = await Promise.all([
+      calIds.length ? checkedRows(sb.from('slots').select('*').in('calendar_id', calIds)) : [],
+      calIds.length ? checkedRows(sb.from('extra_slots').select('*').in('calendar_id', calIds).gte('date', from).lte('date', to)) : [],
+      softRows(sb.from('pay_settings').select('*').eq('workspace_id', wsId)),
+    ]);
+    const slotIds = slots.map(x=>x.id), extraIds = extras.map(x=>x.id);
+    const dated = (table, column, ids)=> ids.length ? softRows(sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
+    const [att, extraAtt, recurring, cancellations] = await Promise.all([
+      dated('attendance', 'slot_id', slotIds),
+      dated('attendance', 'extra_slot_id', extraIds),
+      slotIds.length ? checkedRows(sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
+      dated('lesson_cancellations', 'slot_id', slotIds),
+    ]);
+    if(S.workspace?.id!==wsId || key!==[wsId, ...Object.values(reportRange())].join('|')) return;
+    S.paySettings = Object.assign({}, DEFAULT_PAY, settings[0]||{});
+    S.reportData = {from, to, slots, extras, attendance:att.concat(extraAtt), recurring, cancellations};
+  }catch(error){
+    if(S.workspace?.id===wsId) showDataError(error, 'Caricamento ore');
+  }finally{
+    S.reportLoading = false; render();
+  }
+}
+
+async function savePaySettings(values){
+  if(!isAdmin()) return;
+  try{
+    const row = await checkedRow(sb.from('pay_settings').upsert(Object.assign(
+      {workspace_id:S.workspace.id, updated_at:new Date().toISOString()}, values), {onConflict:'workspace_id'}).select());
+    S.paySettings = Object.assign({}, DEFAULT_PAY, row);
+    toast('Regole compensi salvate.');
+    closeModal();
+  }catch(error){ showDataError(error, 'Salvataggio regole compensi'); closeModal(); }
+}
+
+function reportCsv(rows, from, to){
+  const cell = v=> `"${String(v).replace(/"/g,'""')}"`;
+  const num = n=> String(round2(n)).replace('.', ',');
+  const lines = [['Persona','Data','Lezione','Inizio','Fine','Ore','Tariffa €/h','Compenso €','Nota'].map(cell).join(';')];
+  rows.forEach(p=> p.entries.forEach(e=> lines.push([p.name, e.date, e.label, fmtHM(e.start), fmtHM(e.end), num(e.hours), num(e.rate), num(e.amount), e.note].map(cell).join(';'))));
+  rows.forEach(p=> lines.push([p.name+' TOTALE', from+' / '+to, '', '', '', num(p.hours), '', num(p.amount), p.lessons+' lezioni'].map(cell).join(';')));
+  // BOM: senza, Excel apre gli accenti come caratteri strani
+  return '\ufeff' + lines.join('\r\n');
+}
+
+/* ---------------- lezione annullata in una data (admin) ---------------- */
+function cancellationFor(slotId, dateStr){
+  return S.cancellations.find(c=>c.slot_id===slotId && c.date===dateStr) || null;
+}
+
+// Toglie la lezione settimanale solo in quella data; se richiesto mette al suo
+// posto una lezione extra, anche con orario e durata diversi.
+async function cancelLesson(slotId, dateStr, reason, replacement){
+  if(!isAdmin()) return;
+  if(replacement && (!replacement.start_time || !replacement.end_time || replacement.end_time<=replacement.start_time)){
+    return toast('Controlla gli orari della lezione sostitutiva.');
+  }
+  const ok = await runPresenceWrite('Annullamento lezione', async ()=>{
+    const row = await checkedRow(sb.from('lesson_cancellations')
+      .insert({slot_id:slotId, date:dateStr, reason:reason||null, created_by:myProfileId()}).select());
+    let extra = null;
+    if(replacement){
+      const slot = S.slots.find(x=>x.id===slotId);
+      extra = await checkedRow(sb.from('extra_slots').insert({
+        calendar_id: slot ? slot.calendar_id : calendarForDate(dateStr), date:replacement.date || dateStr,
+        start_time:replacement.start_time, end_time:replacement.end_time,
+        label:replacement.label || (slot ? slot.label : 'Lezione extra'), created_by:myProfileId(),
+      }).select());
+    }
+    return ()=>{
+      S.cancellations.push(row);
+      if(extra && extra.date>=toISO(mondayOf(S.weekOffset)) && extra.date<=toISO(weekDates(mondayOf(S.weekOffset))[6])) S.extraSlots.push(extra);
+      toast(extra ? 'Lezione annullata e sostituita.' : 'Lezione annullata.');
+    };
+  });
+  if(ok) closeModal();
+}
+
+async function restoreLesson(cancellationId){
+  if(!isAdmin()) return;
+  await runPresenceWrite('Ripristino lezione', async ()=>{
+    await checkedRow(sb.from('lesson_cancellations').delete().eq('id', cancellationId).select('id'));
+    return ()=>{ S.cancellations = S.cancellations.filter(c=>c.id!==cancellationId); toast('Lezione ripristinata.'); };
+  });
+}
+
+/* ---------------- richieste di assenza ---------------- */
+function sameLesson(row, ref){ return ref.slot_id ? row.slot_id===ref.slot_id : row.extra_slot_id===ref.extra_slot_id; }
+function myAbsenceRequest(ref, dateStr){
+  if(isGuest()) return null;
+  // la più recente: dopo un rifiuto se ne può fare un'altra
+  return S.absenceRequests.filter(r=> sameLesson(r, ref) && r.date===dateStr && r.instructor_id===myProfileId())
+    .sort((a,b)=> String(b.created_at).localeCompare(String(a.created_at)))[0] || null;
+}
+function absenceLesson(r){
+  const l = r.slots || r.extra_slots || S.slots.find(x=>x.id===r.slot_id) || S.extraSlots.find(x=>x.id===r.extra_slot_id) || {};
+  return `${l.label || 'Lezione'}${l.start_time ? ' '+fmtHM(l.start_time) : ''}`;
+}
+
+async function requestAbsence(ref, dateStr, reason){
+  if(isGuest()) return;
+  const ok = await runPresenceWrite('Richiesta di assenza', async ()=>{
+    const row = await checkedRow(sb.from('absence_requests').insert(Object.assign(
+      {workspace_id:S.workspace.id, instructor_id:myProfileId(), date:dateStr, reason:reason||null}, ref))
+      .select('*, slots(label,start_time,end_time), extra_slots(label,start_time,end_time)'));
+    return ()=>{ S.absenceRequests.push(row); toast('Richiesta inviata: tutti riceveranno un avviso.'); };
+  });
+  if(ok) closeModal();
+}
+
+async function decideAbsence(id, status){
+  if(!isAdmin()) return;
+  const ok = await runPresenceWrite(status==='approvata' ? 'Approvazione assenza' : 'Rifiuto assenza', async ()=>{
+    const row = await checkedRow(sb.from('absence_requests')
+      .update({status, decided_by:myProfileId(), decided_at:new Date().toISOString()}).eq('id', id)
+      .select('*, slots(label,start_time,end_time), extra_slots(label,start_time,end_time)'));
+    return ()=>{ S.absenceRequests = S.absenceRequests.map(r=>r.id===id ? row : r); };
+  });
+  // approvata: il database ha segnato l'assenza, la rileggiamo
+  if(ok && status==='approvata') await refreshWeekData();
+}
+
+async function withdrawAbsence(id){
+  const ok = await runPresenceWrite('Ritiro richiesta di assenza', async ()=>{
+    await checkedRow(sb.from('absence_requests').delete().eq('id', id).select('id'));
+    return ()=>{ S.absenceRequests = S.absenceRequests.filter(r=>r.id!==id); toast('Richiesta ritirata.'); };
+  });
+  if(ok) closeModal();
 }
 
 /* ---------------- calendar/slot management (admin) ---------------- */
@@ -1972,6 +2268,19 @@ async function setInstructorRole(id, role){
   }
 }
 
+async function setInstructorGrade(id, grade){
+  if(!isAdmin() || !GRADE_LABEL[grade]) return;
+  const wsId = S.workspace.id;
+  try{
+    await checkedRow(sb.from('profiles').update({grade}).eq('id', id).eq('workspace_id', wsId).select());
+    if(S.workspace?.id!==wsId) return;
+    toast('Grado aggiornato: '+GRADE_LABEL[grade]+'.');
+    await loadInstructors();
+  }catch(error){
+    if(S.workspace?.id===wsId) showDataError(error, 'Cambio grado');
+  }
+}
+
 async function createGuestLink(label, hours){
   const token = genToken();
   const expires = new Date(Date.now() + hours*3600*1000).toISOString();
@@ -2056,9 +2365,9 @@ function backupCountsHtml(counts){
     .join('') + '</div>';
 }
 
-function downloadText(filename, text){
+function downloadText(filename, text, type='application/json'){
   try{
-    const url = URL.createObjectURL(new Blob([text], {type:'application/json'}));
+    const url = URL.createObjectURL(new Blob([text], {type}));
     const a = document.createElement('a');
     a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
@@ -2176,8 +2485,10 @@ async function restoreBackup(backup){
       if(!slotIds.has(r.slot_id)){ skipped++; return; }
       const who = mapProfile(r.instructor_id);
       if(!who){ skipped++; return; }
-      if(!unique(['r', r.slot_id, who].join('|'))){ skipped++; return; }
-      recurring.push({id:r.id, slot_id:r.slot_id, instructor_id:who, status:r.status});
+      if(!unique(['r', r.slot_id, who, r.ended_on||'attiva'].join('|'))){ skipped++; return; }
+      const row = {id:r.id, slot_id:r.slot_id, instructor_id:who, status:r.status, created_at:r.created_at};
+      if(r.ended_on) row.ended_on = r.ended_on;
+      recurring.push(row);
     });
     await insertAll('recurring_presence', recurring);
 
@@ -2576,6 +2887,7 @@ function renderShell(){
   if(allView) main.className = 'wide';
   if(S.dataError) main.appendChild(renderDataError());
   if(S.tab==='presenze') main.appendChild(renderPresenze());
+  if(S.tab==='ore') main.appendChild(renderOre());
   if(S.tab==='calendari') main.appendChild(renderCalendari());
   if(S.tab==='istruttori') main.appendChild(renderIstruttori());
   if(S.tab==='profilo') main.appendChild(renderProfilo());
@@ -2585,6 +2897,7 @@ function renderShell(){
   const nav = document.createElement('nav');
   nav.className = 'tabbar';
   const tabs = [['presenze','✅','Presenze']];
+  if(!isGuest()) tabs.push(['ore','⏱️','Ore']);
   if(!isGuest() && isAdmin()) tabs.push(['calendari','🗓️','Calendari']);
   if(!isGuest() && isAdmin()) tabs.push(['istruttori','👥','Istruttori']);
   tabs.push(['profilo','👤', isGuest()?'Esci':'Profilo']);
@@ -2593,6 +2906,7 @@ function renderShell(){
     S.tab=b.dataset.tab;
     S.matrixFullscreen = false;
     if(S.tab==='istruttori'){ loadInstructors(); loadGuestLinks(); }
+    if(S.tab==='ore') loadReport();
     render();
   });
   wrap.appendChild(nav);
@@ -2646,6 +2960,7 @@ function renderPresenze(){
         ${S.showAllMatrix ? `<button class="btn secondary sm" id="fsBtn">${S.matrixFullscreen?'✕ Esci da schermo intero':'⤢ Schermo intero'}</button>` : ''}
       </div>
       ${S.showAllMatrix ? '<p class="hint">La vista Tutti è di sola consultazione. Per modificare le tue presenze scegli Personale.</p>' : ''}
+      <div id="absenceHost"></div>
       <div id="daysHost"></div>
     `}
   `;
@@ -2680,6 +2995,28 @@ function renderPresenze(){
     if(S.showAllMatrix && S.instructors.length===0) await loadInstructors();
     render();
   });
+
+  const pending = S.absenceRequests.filter(r=> r.status==='in_attesa' && r.date>=todayISO());
+  if(pending.length){
+    const card = document.createElement('div');
+    card.className = 'card absence-card';
+    card.innerHTML = `<h3>Richieste di assenza (${pending.length})</h3>`;
+    pending.forEach(r=>{
+      const mine = r.instructor_id===myProfileId();
+      const [y,m,dd] = r.date.split('-').map(Number);
+      const row = document.createElement('div');
+      row.className = 'listrow';
+      row.innerHTML = `<div class="main"><div class="t">${esc(instructorName(r.instructor_id))} · ${esc(absenceLesson(r))}</div>
+          <div class="s">${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}${r.reason ? ' · '+esc(r.reason) : ''}</div></div>
+        ${isAdmin() ? `<button class="btn sm" data-ok ${presenceControlsDisabled()?'disabled':''}>Approva</button><button class="btn ghost sm" data-no ${presenceControlsDisabled()?'disabled':''}>Rifiuta</button>`
+          : mine ? `<button class="btn ghost sm" data-wd ${presenceControlsDisabled()?'disabled':''}>Ritira</button>` : '<span class="pill">In attesa</span>'}`;
+      const ok = row.querySelector('[data-ok]'); if(ok) ok.onclick = ()=> decideAbsence(r.id, 'approvata');
+      const no = row.querySelector('[data-no]'); if(no) no.onclick = ()=> decideAbsence(r.id, 'rifiutata');
+      const wd = row.querySelector('[data-wd]'); if(wd) wd.onclick = ()=>{ if(confirm('Ritirare la richiesta di assenza?')) withdrawAbsence(r.id); };
+      card.appendChild(row);
+    });
+    d.querySelector('#absenceHost').appendChild(card);
+  }
 
   const host = d.querySelector('#daysHost');
   // I giorni restano a schermo mentre la stessa settimana si aggiorna: svuotarli
@@ -2755,7 +3092,7 @@ function slotsForDate(dt){
   const effectiveCalId = S.selectedCalendarOverrideId || calendarForDate(dateStr);
   const weekly = S.slots
     .filter(s=> s.calendar_id === effectiveCalId && s.weekday===wd)
-    .map(s=>({ref:{slot_id:s.id}, label:s.label, start:s.start_time, end:s.end_time, extra:false, id:s.id, calendar_id:s.calendar_id}));
+    .map(s=>({ref:{slot_id:s.id}, label:s.label, start:s.start_time, end:s.end_time, extra:false, id:s.id, calendar_id:s.calendar_id, cancelled:cancellationFor(s.id, dateStr)}));
   const extras = S.extraSlots
     .filter(e=> e.date===dateStr && (!e.calendar_id || e.calendar_id === effectiveCalId))
     .map(e=>({ref:{extra_slot_id:e.id}, label:e.label, start:e.start_time, end:e.end_time, extra:true, id:e.id, calendar_id:e.calendar_id, created_by:e.created_by}));
@@ -2774,6 +3111,18 @@ function renderDayList(dt){
     return day;
   }
   items.forEach(it=>{
+    if(it.cancelled){
+      const row = document.createElement('div');
+      row.className = 'slot cancelled';
+      row.innerHTML = `
+        <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
+        <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">Annullata${it.cancelled.reason ? ' · '+esc(it.cancelled.reason) : ''}</div></div>
+        ${isAdmin() ? `<button class="btn ghost sm" data-restore ${presenceControlsDisabled() ? 'disabled' : ''}>Ripristina</button>` : ''}`;
+      const restore = row.querySelector('[data-restore]');
+      if(restore) restore.onclick = ()=>{ if(confirm('Ripristinare questa lezione?')) restoreLesson(it.cancelled.id); };
+      day.appendChild(row);
+      return;
+    }
     const state = myAttendanceState(it.ref, dateStr);
     const btnClass = state==='presente' ? 'on' : state==='assente' ? 'off' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : '';
     const btnLabel = state==='presente' ? '✅ Presente' : state==='assente' ? '❌ Assente' : state==='ricorrente' ? '✅ Presente 🔁' : state==='ricorrente-assente' ? '❌ Assente 🔁' : 'Segna presenza';
@@ -2782,11 +3131,14 @@ function renderDayList(dt){
     const canLog = !isGuest();
     const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
     const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
+    const absence = myAbsenceRequest(it.ref, dateStr);
+    const absenceText = !absence ? '' : absence.status==='in_attesa' ? ' · ⏳ assenza richiesta' : absence.status==='approvata' ? ' · assenza approvata' : ' · assenza rifiutata';
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
-      <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}</div></div>
+      <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
+      ${!isGuest() ? `<button class="btn ghost sm morebtn" title="Altre azioni: richiesta di assenza${isAdmin()?', annulla lezione':''}" aria-label="Altre azioni">⋯</button>` : ''}
       ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
       ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Ripeti lo stato ogni settimana su questo orario" ${presenceControlsDisabled() ? 'disabled' : ''}>🔁</button>` : ''}
       <button class="togglebtn ${btnClass}" ${presenceControlsDisabled() ? 'disabled' : ''}>${btnLabel}</button>
@@ -2800,6 +3152,8 @@ function renderDayList(dt){
     };
     const recurBtn = row.querySelector('.recurbtn');
     if(recurBtn) recurBtn.onclick = ()=> toggleRecurring(it.ref, it.id, dateStr);
+    const moreBtn = row.querySelector('.morebtn');
+    if(moreBtn) moreBtn.onclick = ()=> openModal({type:'lesson-actions', ref:it.ref, date:dateStr, label:it.label, start:it.start, end:it.end, extra:it.extra, slotId:it.id});
     const delBtn = row.querySelector('[data-del]');
     if(delBtn) delBtn.onclick = ()=>{ if(confirm('Eliminare questa lezione extra?')) deleteExtraSlot(it.id); };
     day.appendChild(row);
@@ -2811,9 +3165,9 @@ function renderDayMatrix(dt){
   const day = document.createElement('div');
   day.className = 'day';
   const dateStr = toISO(dt);
-  const items = slotsForDate(dt);
   const isToday = dateStr===todayISO();
   day.innerHTML = `<h3 class="dayhead">${WEEKDAYS[(dt.getDay()+6)%7]} <span class="d">${fmtDayShort(dt)}${isToday?' · oggi':''}</span></h3>`;
+  const items = slotsForDate(dt).filter(it=> !it.cancelled);
   if(items.length===0){ day.innerHTML += `<p class="hint" style="margin-bottom:12px">Nessuna lezione.</p>`; return day; }
 
   const people = (S.instructors.length ? S.instructors : [S.profile].filter(Boolean))
@@ -2843,8 +3197,8 @@ function renderDayMatrix(dt){
         return sameSlot && a.date===dateStr && c.match(a);
       });
       let state = row ? row.status : null;
-      if(!state && !c.guestCol && !it.extra && recurringAppliesOn(dateStr)){
-        const rs = recurringStatusFor(it.id, c.instructorId);
+      if(!state && !c.guestCol && !it.extra){
+        const rs = recurringStatusOn(it.id, c.instructorId, dateStr);
         if(rs) state = rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
       }
       const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : state==='assente' ? 'off' : '';
@@ -2870,6 +3224,120 @@ function renderDayMatrix(dt){
   }
   day.appendChild(wrapT);
   return day;
+}
+
+/* -------- Ore tab: ore e compensi (ognuno vede i propri, l'admin tutti) -------- */
+function renderOre(){
+  const d = document.createElement('div');
+  const {from, to} = reportRange();
+  const data = S.reportData && S.reportData.from===from && S.reportData.to===to ? S.reportData : null;
+  const today = todayISO();
+  const fmtDate = iso=>{ const [y,m,dd] = iso.split('-').map(Number); return `${dd} ${MONTHS[m-1]} ${y}`; };
+  const periodLabel = S.reportMode==='month'
+    ? new Date(+from.slice(0,4), +from.slice(5,7)-1, 1).toLocaleDateString('it-IT', {month:'long', year:'numeric'})
+    : `${fmtDate(from)} – ${fmtDate(to)}`;
+  d.innerHTML = `
+    <div class="row between noprint" style="margin-bottom:12px">
+      <h1 style="margin:0">Ore e compensi</h1>
+      ${isAdmin() ? '<button class="btn secondary sm" id="payRules">⚙️ Regole e tariffe</button>' : ''}
+    </div>
+    <div class="row noprint" style="margin-bottom:12px">
+      <div class="segbtns" id="repMode">
+        <button data-m="week" class="${S.reportMode==='week'?'on':''}">Settimana</button>
+        <button data-m="month" class="${S.reportMode==='month'?'on':''}">Mese</button>
+        <button data-m="custom" class="${S.reportMode==='custom'?'on':''}">Periodo</button>
+      </div>
+      ${isAdmin() ? `<select id="repPerson" class="calpick"><option value="">Tutti</option>${S.instructors.map(p=>`<option value="${p.id}" ${S.reportPerson===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select>` : ''}
+    </div>
+    ${S.reportMode==='custom' ? `
+      <div class="row noprint" style="margin-bottom:12px">
+        <label class="field grow" style="margin:0"><span>Dal</span><input type="date" id="repFrom" value="${from}"></label>
+        <label class="field grow" style="margin:0"><span>Al</span><input type="date" id="repTo" value="${to}"></label>
+        <button class="btn secondary sm" id="repGo" style="align-self:flex-end">Calcola</button>
+      </div>` : `
+      <div class="weeknav noprint">
+        <button class="arrow" id="repPrev" aria-label="Periodo precedente">‹</button>
+        <div class="wk">${esc(periodLabel)}<small>${to>today ? 'Contate le lezioni fino a oggi' : 'Periodo concluso'}</small></div>
+        <button class="arrow" id="repNext" aria-label="Periodo successivo">›</button>
+      </div>`}
+    <div class="printonly"><h2>${esc(S.workspace.name)} · Ore e compensi</h2><p>${esc(periodLabel)}${to>today ? ' (fino al '+esc(fmtDate(today))+')' : ''}</p></div>
+    <div id="repHost"></div>`;
+
+  d.querySelectorAll('#repMode button').forEach(b=> b.onclick = ()=>{
+    if(b.dataset.m==='custom'){ S.reportFrom = from; S.reportTo = to; }
+    else S.reportFrom = '';
+    S.reportMode = b.dataset.m; loadReport();
+  });
+  const rules = d.querySelector('#payRules');
+  if(rules) rules.onclick = ()=> openModal({type:'pay-settings'});
+  const personSel = d.querySelector('#repPerson');
+  if(personSel) personSel.onchange = ()=>{ S.reportPerson = personSel.value; render(); };
+  const prev = d.querySelector('#repPrev'); if(prev) prev.onclick = ()=> shiftReport(-1);
+  const next = d.querySelector('#repNext'); if(next) next.onclick = ()=> shiftReport(1);
+  const go = d.querySelector('#repGo');
+  if(go) go.onclick = ()=>{
+    const f = d.querySelector('#repFrom').value, t = d.querySelector('#repTo').value;
+    if(!f || !t || t<f) return toast('Scegli un periodo valido.');
+    S.reportFrom = f; S.reportTo = t; loadReport();
+  };
+
+  const host = d.querySelector('#repHost');
+  if(!data){
+    host.innerHTML = `<p class="hint" role="status">${S.reportLoading ? 'Calcolo in corso…' : 'Dati non caricati.'}</p>`;
+    if(!S.reportLoading){
+      const retry = document.createElement('button');
+      retry.className = 'btn secondary sm'; retry.textContent = 'Calcola';
+      retry.onclick = loadReport; host.appendChild(retry);
+    }
+    return d;
+  }
+  // le lezioni future non sono ancora state fatte
+  const upTo = to < today ? to : today;
+  const all = from>upTo ? [] : computePayroll(Object.assign({}, data, {to:upTo}), S.paySettings, S.instructors, calendarForDate);
+  // l'istruttore vede solo i propri numeri
+  const rows = all.filter(p=> isAdmin() ? (!S.reportPerson || p.key===S.reportPerson) && (p.lessons || p.key===S.reportPerson || S.instructors.some(i=>i.id===p.key)) : p.key===myProfileId());
+  const tot = rows.reduce((a,p)=>({hours:a.hours+p.hours, amount:a.amount+p.amount, lessons:a.lessons+p.lessons}), {hours:0, amount:0, lessons:0});
+
+  const summary = document.createElement('div');
+  summary.className = 'card';
+  summary.innerHTML = `
+    <table class="report">
+      <thead><tr><th>Persona</th><th>Lezioni</th><th>Ore</th><th>Compenso</th></tr></thead>
+      <tbody>${rows.map(p=>`<tr><td>${esc(p.name)}${p.grade==='maestro'?' <span class="tag">Maestro</span>':''}</td><td>${p.lessons}</td><td>${fmtHours(p.hours)}</td><td>${euro(p.amount)}</td></tr>`).join('') || '<tr><td colspan="4" class="hint">Nessuna lezione nel periodo.</td></tr>'}</tbody>
+      ${rows.length>1 ? `<tfoot><tr><td>Totale</td><td>${tot.lessons}</td><td>${fmtHours(tot.hours)}</td><td>${euro(tot.amount)}</td></tr></tfoot>` : ''}
+    </table>
+    <div class="row noprint" style="margin-top:12px">
+      <label class="checkrow" style="margin:0"><input type="checkbox" id="repDetail" ${S.reportDetail?'checked':''}><span>Dettaglio lezioni</span></label>
+      <span class="grow"></span>
+      <button class="btn secondary sm" id="repCsv">⬇ CSV</button>
+      <button class="btn sm" id="repPrint">🖨 Stampa</button>
+    </div>
+    ${S.paySettings && !S.paySettings.default_rate && !Object.keys(S.paySettings.rates||{}).length ? `<p class="hint noprint">Nessuna tariffa impostata: i compensi risultano 0. ${isAdmin()?'Impostale da “Regole e tariffe”.':'Chiedi all’amministratore di impostarle.'}</p>` : ''}`;
+  summary.querySelector('#repDetail').onchange = e=>{ S.reportDetail = e.target.checked; render(); };
+  summary.querySelector('#repPrint').onclick = async ()=>{
+    // nell'APK window.print() non fa nulla: usiamo la stampa di Android (anche "Salva come PDF")
+    const native = nativeNotifications();
+    if(!native) return window.print();
+    if(!native.printPage) return toast('Aggiorna l’app per stampare o salvare in PDF.');
+    try{ await native.printPage(`Ore ${from} - ${upTo}`); }
+    catch(e){ console.error('Presencer: stampa', e); toast('Stampa non disponibile su questo dispositivo.'); }
+  };
+  summary.querySelector('#repCsv').onclick = ()=>{
+    const name = `ore-${from}-${upTo}.csv`;
+    if(!downloadText(name, reportCsv(rows, from, upTo), 'text/csv;charset=utf-8')) toast('Download non riuscito.');
+  };
+  host.appendChild(summary);
+
+  if(S.reportDetail) rows.filter(p=>p.entries.length).forEach(p=>{
+    const card = document.createElement('div');
+    card.className = 'card report-detail';
+    card.innerHTML = `<h3>${esc(p.name)}</h3>
+      <table class="report"><thead><tr><th>Data</th><th>Lezione</th><th>Ore</th><th>Compenso</th></tr></thead><tbody>
+      ${p.entries.map(e=>{ const [y,m,dd] = e.date.split('-').map(Number); return `<tr><td>${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}</td><td>${esc(e.label)} <span class="hint">${fmtHM(e.start)}–${fmtHM(e.end)}${e.note?' · '+esc(e.note):''}</span></td><td>${fmtHours(e.hours)}</td><td>${euro(e.amount)}</td></tr>`; }).join('')}
+      </tbody><tfoot><tr><td colspan="2">Totale</td><td>${fmtHours(p.hours)}</td><td>${euro(p.amount)}</td></tr></tfoot></table>`;
+    host.appendChild(card);
+  });
+  return d;
 }
 
 /* -------- Calendari tab (admin) -------- */
@@ -2981,7 +3449,8 @@ function renderIstruttori(){
     row.className = 'listrow';
     const av = p.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="">` : esc((p.name||'?').trim().slice(0,1).toUpperCase());
     row.innerHTML = `<div class="avatar" style="width:36px;height:36px">${av}</div>
-      <div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.role==='admin'?'Amministratore':'Istruttore'}</div></div>
+      <div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.role==='admin'?'Amministratore':'Istruttore'}${p.grade==='maestro'?' · Maestro caposcuola':''}</div></div>
+      <button class="btn ghost sm" data-grade>${p.grade==='maestro'?'Togli maestro':'Rendi maestro'}</button>
       ${p.id!==S.profile.id ? `<button class="btn ghost sm" data-role>${p.role==='admin'?'Rendi istruttore':'Rendi admin'}</button>` : ''}
       ${(p.id!==S.profile.id && p.role!=='admin') ? `<button class="btn ghost sm" data-rm>Rimuovi</button>` : ''}`;
     const roleBtn = row.querySelector('[data-role]');
@@ -2989,6 +3458,10 @@ function renderIstruttori(){
       const next = p.role==='admin' ? 'instructor' : 'admin';
       const msg = next==='admin' ? `Rendere ${p.name} amministratore? Potrà modificare calendari, orari e membri.` : `Togliere i permessi di amministratore a ${p.name}?`;
       if(confirm(msg)) setInstructorRole(p.id, next);
+    };
+    row.querySelector('[data-grade]').onclick = ()=>{
+      const next = p.grade==='maestro' ? 'istruttore' : 'maestro';
+      if(confirm(next==='maestro' ? `Rendere ${p.name} maestro caposcuola? Con la regola attiva incassa per intero le lezioni a cui partecipa.` : `Togliere a ${p.name} il grado di maestro caposcuola?`)) setInstructorGrade(p.id, next);
     };
     const rm = row.querySelector('[data-rm]');
     if(rm) rm.onclick = ()=>{ if(confirm(`Rimuovere ${p.name} dallo spazio?`)) removeInstructor(p.id); };
@@ -3399,6 +3872,79 @@ function renderModal(){
       <label class="field"><span>Codice invito</span><input type="text" id="jw_code" style="text-transform:uppercase"></label>
       <button class="btn block" id="jw_go">Entra</button>`;
     box.querySelector('#jw_go').onclick = ()=> joinAdditionalWorkspace(box.querySelector('#jw_code').value.trim());
+  }
+
+  else if(m.type==='lesson-actions'){
+    const [y,mo,dd] = m.date.split('-').map(Number);
+    const dateLabel = `${WEEKDAYS[(new Date(y,mo-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[mo-1]} ${y}`;
+    const req = myAbsenceRequest(m.ref, m.date);
+    const canAsk = !req || req.status==='rifiutata';
+    const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
+    box.innerHTML = `
+      <div class="mhead"><h2>${esc(m.label)}</h2><button id="x">✕</button></div>
+      <p class="hint" style="margin:0 0 14px">${esc(fmtHM(m.start))}–${esc(fmtHM(m.end))} · ${dateLabel}</p>
+      <h3>Richiesta di assenza</h3>
+      ${canAsk ? `
+        ${req ? '<p class="hint" style="margin:0 0 8px">La richiesta precedente è stata rifiutata.</p>' : ''}
+        <label class="field"><span>Motivo (facoltativo)</span><input type="text" id="ab_reason" placeholder="Es. visita medica"></label>
+        <button class="btn block" id="ab_send">Chiedi di assentarti</button>
+        <p class="hint">Tutti i membri ricevono un avviso; un amministratore conferma o rifiuta.</p>`
+      : `<p class="hint" style="margin:0 0 8px">${req.status==='in_attesa' ? '⏳ Richiesta inviata, in attesa di conferma.' : '✅ Assenza approvata.'}</p>
+        ${req.status==='in_attesa' ? '<button class="btn secondary block" id="ab_withdraw">Ritira richiesta</button>' : ''}`}
+      ${isAdmin() && !m.extra ? `
+        <h3 style="margin-top:22px">Annulla questa lezione</h3>
+        <p class="hint" style="margin:0 0 10px">Vale solo per ${dateLabel}: le altre settimane restano invariate.</p>
+        <label class="field"><span>Motivo (facoltativo)</span><input type="text" id="cl_reason" placeholder="Es. palestra chiusa"></label>
+        <label class="checkrow"><input type="checkbox" id="cl_repl"><span>Sostituisci con una lezione extra</span></label>
+        <div id="cl_fields" class="hidden">
+          <label class="field"><span>Data</span><input type="date" id="cl_date" value="${m.date}"></label>
+          <label class="field"><span>Etichetta</span><input type="text" id="cl_label" value="${esc(slot ? slot.label : m.label)}"></label>
+          <div class="row">
+            <label class="field grow"><span>Inizio</span><input type="time" id="cl_start" value="${fmtHM(m.start)}"></label>
+            <label class="field grow"><span>Fine</span><input type="time" id="cl_end" value="${fmtHM(m.end)}"></label>
+          </div>
+        </div>
+        <button class="btn danger block" id="cl_go">Annulla lezione</button>` : ''}`;
+    const send = box.querySelector('#ab_send');
+    if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim());
+    const withdraw = box.querySelector('#ab_withdraw');
+    if(withdraw) withdraw.onclick = ()=> withdrawAbsence(req.id);
+    const repl = box.querySelector('#cl_repl');
+    if(repl) repl.onchange = ()=> box.querySelector('#cl_fields').classList.toggle('hidden', !repl.checked);
+    const clGo = box.querySelector('#cl_go');
+    if(clGo) clGo.onclick = ()=>{
+      const replacement = repl.checked ? {
+        date: box.querySelector('#cl_date').value, label: box.querySelector('#cl_label').value.trim(),
+        start_time: box.querySelector('#cl_start').value, end_time: box.querySelector('#cl_end').value,
+      } : null;
+      if(confirm(replacement ? 'Annullare la lezione e creare quella sostitutiva?' : 'Annullare la lezione di questa data?')) cancelLesson(m.slotId, m.date, box.querySelector('#cl_reason').value.trim(), replacement);
+    };
+  }
+
+  else if(m.type==='pay-settings'){
+    const pay = Object.assign({}, DEFAULT_PAY, S.paySettings||{});
+    // i tipi di lezione sono le etichette usate negli orari e nelle lezioni extra
+    const labels = Array.from(new Map(S.slots.concat(S.reportData ? S.reportData.extras : [])
+      .map(x=>[rateKey(x.label), x.label.trim()])).entries()).filter(([k])=>k).sort((a,b)=>a[1].localeCompare(b[1]));
+    box.innerHTML = `
+      <div class="mhead"><h2>Regole e tariffe</h2><button id="x">✕</button></div>
+      <h3>Tariffa oraria per tipo di lezione</h3>
+      <p class="hint" style="margin:0 0 10px">Il tipo è l'etichetta della lezione. Lascia vuoto per usare la tariffa predefinita.</p>
+      ${labels.map(([k,l],i)=>`<label class="field rate"><span>${esc(l)}</span><input type="number" min="0" step="0.5" inputmode="decimal" data-rate="${esc(k)}" id="pr_${i}" value="${pay.rates[k]!=null ? esc(pay.rates[k]) : ''}" placeholder="${esc(pay.default_rate)}"> €/h</label>`).join('') || '<p class="hint">Nessun orario ancora.</p>'}
+      <label class="field rate"><span>Tariffa predefinita</span><input type="number" min="0" step="0.5" inputmode="decimal" id="pr_default" value="${esc(pay.default_rate)}"> €/h</label>
+      <h3 style="margin-top:18px">Regole</h3>
+      <label class="field rate"><span>Compresenza: quota della tariffa a testa</span><input type="number" min="0" max="100" step="0.01" inputmode="decimal" id="pr_factor" value="${round2(pay.copresence_factor*100)}"> %</label>
+      <p class="hint" style="margin:-6px 0 12px">66,67% = 2/3 della tariffa a ciascuno. 50% con due istruttori = tariffa divisa a metà.</p>
+      <label class="checkrow"><input type="checkbox" id="pr_master" ${pay.master_takes_all?'checked':''}><span><b>Il maestro caposcuola prende tutto</b><small>Se è presente, il compenso della lezione va solo a lui e non si divide con gli istruttori.</small></span></label>
+      <button class="btn block" id="pr_save">Salva</button>`;
+    box.querySelector('#pr_save').onclick = ()=>{
+      const rates = {};
+      box.querySelectorAll('[data-rate]').forEach(i=>{ if(i.value!=='') rates[i.dataset.rate] = Math.max(0, Number(i.value)); });
+      const factor = Number(box.querySelector('#pr_factor').value);
+      if(!(factor>=0 && factor<=100)) return toast('La quota di compresenza va da 0 a 100%.');
+      savePaySettings({rates, default_rate:Math.max(0, Number(box.querySelector('#pr_default').value)||0),
+        copresence_factor:round2(factor)/100, master_takes_all:box.querySelector('#pr_master').checked});
+    };
   }
 
   else if(m.type==='lesson-log'){

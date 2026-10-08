@@ -839,8 +839,10 @@
     schedule: { name: "Orari e lezioni", description: "Modifiche agli orari e alle lezioni extra" },
     calendar: { name: "Calendari", description: "Modifiche ai calendari e alle attivazioni" },
     lesson_log: { name: "Registri lezione", description: "Modifiche alle voci dei registri lezione" },
-    members: { name: "Membri", description: "Modifiche ai membri e ai loro ruoli" }
+    members: { name: "Membri", description: "Modifiche ai membri e ai loro ruoli" },
+    absence: { name: "Richieste di assenza", description: "Richieste di assenza e loro conferma" }
   };
+  var PresencerPrint = registerPlugin("PresencerPrint");
   function channelId(category) {
     return `presencer_${CHANNELS[category] ? category : "schedule"}`;
   }
@@ -939,6 +941,10 @@
         console.warn("Push non disponibili", err);
         return null;
       }
+    },
+    // Stampa di sistema della pagina: stampante oppure "Salva come PDF".
+    async printPage(name) {
+      await PresencerPrint.print({ name });
     },
     async unregisterPush() {
       if (!Capacitor.isNativePlatform()) return;

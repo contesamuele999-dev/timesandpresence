@@ -200,3 +200,46 @@ test('la cancellazione di una lezione extra è applicata solo dopo conferma del 
   assert.equal(S.attendance.length, 1);
   assert.equal(S.attendance[0].id, 'other');
 });
+
+test('compensi: tariffa piena, compresenza a 2/3, maestro prende tutto, annullate escluse', () => {
+  const { app } = appWith();
+  const people = [
+    { id: 'a', name: 'Anna', grade: 'istruttore' },
+    { id: 'b', name: 'Bruno', grade: 'istruttore' },
+    { id: 'm', name: 'Maestro', grade: 'maestro' },
+  ];
+  // 2026-09-07 e 2026-09-14 sono lunedì; lezione da un'ora e mezza
+  const slots = [{ id: 's', calendar_id: 'cal', weekday: 0, start_time: '09:00', end_time: '10:30', label: 'Adulti ' }];
+  const present = (who, date) => ({ slot_id: 's', instructor_id: who, date, status: 'presente' });
+  const data = attendance => ({
+    from: '2026-09-07', to: '2026-09-07', slots, extras: [], cancellations: [], recurring: [], attendance,
+  });
+  const pay = { default_rate: 10, rates: { adulti: 20 }, copresence_factor: 0.6667, master_takes_all: true };
+  const run = (d, p = pay) => Object.fromEntries(app.computePayroll(d, p, people, () => 'cal').map(r => [r.key, r]));
+
+  const solo = run(data([present('a', '2026-09-07')]));
+  assert.equal(solo.a.amount, 30);
+  assert.equal(solo.a.hours, 1.5);
+  assert.equal(solo.b.lessons, 0);
+
+  const two = run(data([present('a', '2026-09-07'), present('b', '2026-09-07')]));
+  assert.equal(two.a.amount, 20);
+  assert.equal(two.b.amount, 20);
+
+  const master = run(data([present('a', '2026-09-07'), present('m', '2026-09-07')]));
+  assert.equal(master.m.amount, 30);
+  assert.equal(master.a.amount, 0);
+  assert.equal(master.a.hours, 1.5);
+  // regola disattivata: anche il maestro è in compresenza
+  const off = run(data([present('a', '2026-09-07'), present('m', '2026-09-07')]), { ...pay, master_takes_all: false });
+  assert.equal(off.m.amount, 20);
+
+  // ricorrenza creata mercoledì 2 settembre: conta da lunedì 31 agosto, un'assenza esplicita la sospende,
+  // una lezione annullata non si paga
+  const recurring = [{ slot_id: 's', instructor_id: 'b', status: 'presente', created_at: '2026-09-02T10:00:00Z', ended_on: null }];
+  const month = { ...data([{ slot_id: 's', instructor_id: 'b', date: '2026-09-21', status: 'assente' }]),
+    from: '2026-08-24', to: '2026-09-30', recurring, cancellations: [{ slot_id: 's', date: '2026-09-14' }] };
+  const r = run(month);
+  assert.equal(r.b.entries.map(e => e.date).join(), '2026-08-31,2026-09-07,2026-09-28');
+  assert.equal(r.b.amount, 90);
+});

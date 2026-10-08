@@ -8,7 +8,16 @@ const db = {
   slots: [0, 2, 4].map(weekday => ({ id: `slot-${weekday}`, calendar_id: 'cal-test', weekday, start_time: '18:00', end_time: '19:00', label: 'Lezione di prova' })),
   attendance: [], recurring_presence: [], extra_slots: [], lesson_logs: [],
   calendar_periods: [], notification_preferences: [], app_events: [],
+  lesson_cancellations: [], absence_requests: [], pay_settings: [],
 };
+// Un mese di presenze finte, per vedere la scheda Ore con qualche numero.
+const monday = new Date(); monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+for (let week = 1; week <= 4; week++) {
+  const day = new Date(monday); day.setDate(monday.getDate() - 7 * week);
+  db.attendance.push({ id: `att-p-${week}`, slot_id: 'slot-0', instructor_id: profile.id, date: iso(day), status: 'presente' });
+  if (week % 2) db.attendance.push({ id: `att-o-${week}`, slot_id: 'slot-0', instructor_id: 'other-test', date: iso(day), status: 'presente' });
+}
 let failNextWrite = false;
 let eventListener;
 const client = mockClient(async request => {
@@ -29,11 +38,16 @@ const client = mockClient(async request => {
   }));
   let result = selected;
   if (request.operation === 'insert') {
-    const row = { id: crypto.randomUUID(), ...request.payload };
+    const row = { id: crypto.randomUUID(), created_at: new Date().toISOString(), ...(request.table === 'absence_requests' ? { status: 'in_attesa' } : {}), ...request.payload };
     rows.push(row);
     result = [row];
   }
   if (request.operation === 'update') selected.forEach(row => Object.assign(row, request.payload));
+  if (request.operation === 'upsert') {
+    const row = { ...(rows[0] || {}), ...request.payload };
+    db[request.table] = [row];
+    result = [row];
+  }
   if (request.operation === 'delete') db[request.table] = rows.filter(row => !selected.includes(row));
   if (request.single && result.length !== 1) return { error: { code: 'PGRST116' } };
   return { data: structuredClone(request.single || request.maybeSingle ? result[0] || null : result) };

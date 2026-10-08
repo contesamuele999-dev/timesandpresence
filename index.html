@@ -286,7 +286,9 @@
 
   .listrow{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}
   .listrow:last-child{border-bottom:none}
-  .listrow .main{flex:1;min-width:0}
+  .listrow{flex-wrap:wrap}
+  /* con tre pulsanti (grado, ruolo, rimuovi) i pulsanti vanno a capo invece di coprire il nome */
+  .listrow .main{flex:1 1 140px;min-width:0}
   .listrow .main .t{font-weight:700;font-size:14px}
   .listrow .main .s{font-size:12px;color:var(--muted)}
 
@@ -301,6 +303,29 @@
   label.checkrow{display:flex;align-items:center;gap:10px;margin:2px 0 14px;font-size:14px;
     color:var(--text);cursor:pointer}
   label.checkrow input{width:18px;height:18px;accent-color:var(--brand);flex-shrink:0}
+  /* ---------- lezioni annullate, richieste di assenza, ore ---------- */
+  .slot.cancelled{opacity:.6;background:#F6F5F3}
+  .slot.cancelled .lbl{text-decoration:line-through}
+  button.morebtn{flex-shrink:0;padding:8px 10px;font-size:16px;font-weight:800}
+  .absence-card{border-color:#F3D2B5;background:#FFF9F3}
+  label.field.rate{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  label.field.rate span{flex:1 1 100%;margin:0}
+  label.field.rate input{width:120px;padding:10px 12px;border:1.5px solid var(--line);border-radius:12px;font:inherit}
+  table.report{width:100%;border-collapse:collapse;font-size:14px}
+  table.report th,table.report td{padding:8px 6px;text-align:right;border-bottom:1px solid var(--line)}
+  table.report th:first-child,table.report td:first-child,
+  table.report th:nth-child(2):not(:last-child){text-align:left}
+  table.report thead th{font-size:12px;color:var(--muted);text-transform:uppercase}
+  table.report tfoot td{font-weight:800;border-bottom:none}
+  .report-detail table.report td:nth-child(2){text-align:left}
+  .printonly{display:none}
+  @media print{
+    header.topbar,nav.tabbar,.installbar,.noprint,.data-error,.toast{display:none !important}
+    .printonly{display:block}
+    main{padding:0;max-width:none}
+    .card{border:none;padding:0;break-inside:avoid}
+    body,html{background:#fff}
+  }
   label.checkrow span{display:flex;flex-direction:column;gap:2px}
   label.checkrow small{display:block;color:var(--muted);font-size:12px;line-height:1.35}
   label.checkrow.notification-master{background:#F6F5F3;border-radius:12px;padding:12px;margin-bottom:12px}

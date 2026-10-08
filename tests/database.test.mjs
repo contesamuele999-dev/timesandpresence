@@ -50,6 +50,8 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   await db.exec(await sqlFile('migration_notifications.sql'));
   // L'aggiornamento è riapplicabile anche su un database già configurato.
   await db.exec(await sqlFile('migration_notifications.sql'));
+  await db.exec(await sqlFile('migration_ore_compensi.sql'));
+  await db.exec(await sqlFile('migration_ore_compensi.sql'));
 
   async function scenario(name, fn) {
     await t.test(name, async () => {
@@ -59,6 +61,12 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   }
   async function asUser(user = ids.user) {
     await db.exec(`set local role authenticated; set local request.jwt.claim.sub = '${user}';`);
+  }
+  // Un errore atteso non deve invalidare il resto della transazione del caso.
+  async function fails(sql, pattern) {
+    await db.exec('savepoint atteso');
+    await assert.rejects(db.query(sql), pattern);
+    await db.exec('rollback to savepoint atteso');
   }
   const insertPresence = () => db.query(`
     insert into attendance (slot_id, instructor_id, date)
@@ -104,6 +112,56 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   await scenario('la sola foto profilo non genera notifiche sui membri', async () => {
     await db.exec(`update profiles set avatar_url = 'https://example.test/avatar.png' where id = '${ids.profile}'`);
     assert.equal((await db.query('select * from app_events')).rows.length, 0);
+  });
+
+  await scenario('un istruttore non può darsi ruolo admin o grado maestro', async () => {
+    await asUser();
+    await fails(`update profiles set role = 'admin' where id = '${ids.profile}'`, /amministratore/);
+    await fails(`update profiles set grade = 'maestro' where id = '${ids.profile}'`, /amministratore/);
+    await db.query(`update profiles set name = 'Nuovo nome' where id = '${ids.profile}'`);
+  });
+
+  await scenario('un admin assegna il grado maestro', async () => {
+    await asUser(ids.other);
+    const { rows } = await db.query(`update profiles set grade = 'maestro' where id = '${ids.profile}' returning grade`);
+    assert.equal(rows[0].grade, 'maestro');
+  });
+
+  await scenario('richiesta di assenza: avvisa tutti e, approvata, segna assente', async () => {
+    await asUser();
+    const { rows: [request] } = await db.query(`
+      insert into absence_requests (workspace_id, slot_id, instructor_id, date, reason)
+      values ($1, $2, $3, '2026-08-24', 'Visita medica') returning *`, [ids.ws, ids.slot, ids.profile]);
+    // l'istruttore non può approvarsi da solo
+    const self = await db.query("update absence_requests set status = 'approvata' where id = $1 returning id", [request.id]);
+    assert.equal(self.rows.length, 0);
+    await asUser(ids.other);
+    await db.query("update absence_requests set status = 'approvata', decided_by = $2 where id = $1", [request.id, ids.admin]);
+    const { rows: [presence] } = await db.query('select status from attendance where instructor_id = $1', [ids.profile]);
+    assert.equal(presence.status, 'assente');
+    const { rows } = await db.query("select category, title from app_events order by id");
+    assert.deepEqual(rows.map(e => e.title), ['Richiesta di assenza', 'Assenza approvata']);
+    assert.ok(rows.every(e => e.category === 'absence'));
+  });
+
+  await scenario('solo un admin annulla una lezione in una data', async () => {
+    await asUser();
+    await fails(`insert into lesson_cancellations (slot_id, date) values ('${ids.slot}', '2026-08-24')`, /row-level security/);
+    await asUser(ids.other);
+    await db.query(`insert into lesson_cancellations (slot_id, date) values ('${ids.slot}', '2026-08-24')`);
+    const { rows } = await db.query('select title from app_events');
+    assert.deepEqual(rows.map(e => e.title), ['Lezione annullata']);
+  });
+
+  await scenario('una ricorrenza chiusa resta nello storico e se ne può aprire una nuova', async () => {
+    await asUser();
+    await db.exec(`
+      insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}');
+      update recurring_presence set ended_on = '2026-08-24';
+      insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}');
+    `);
+    assert.equal((await db.query('select * from recurring_presence')).rows.length, 2);
+    await fails(`insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}')`, /duplicate key/);
   });
 
   await scenario('gli altri trigger funzionano anche in UPDATE e DELETE', async () => {

@@ -1,4 +1,4 @@
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { App } from '@capacitor/app';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { PushNotifications } from '@capacitor/push-notifications';
@@ -10,7 +10,10 @@ const CHANNELS = {
   calendar: {name:'Calendari', description:'Modifiche ai calendari e alle attivazioni'},
   lesson_log: {name:'Registri lezione', description:'Modifiche alle voci dei registri lezione'},
   members: {name:'Membri', description:'Modifiche ai membri e ai loro ruoli'},
+  absence: {name:'Richieste di assenza', description:'Richieste di assenza e loro conferma'},
 };
+// android/app/src/main/java/it/presencer/app/PrintPlugin.java
+const PresencerPrint = registerPlugin('PresencerPrint');
 
 function channelId(category){
   return `presencer_${CHANNELS[category] ? category : 'schedule'}`;
@@ -122,6 +125,10 @@ window.PresencerNative = {
       console.warn('Push non disponibili', err);
       return null;
     }
+  },
+  // Stampa di sistema della pagina: stampante oppure "Salva come PDF".
+  async printPage(name){
+    await PresencerPrint.print({name});
   },
   async unregisterPush(){
     if(!Capacitor.isNativePlatform()) return;

@@ -13,6 +13,8 @@ Il client resta HTML/CSS/JS puro + [Supabase](https://supabase.com) (database + 
 2. Una volta creato, vai su **SQL Editor** → **New query**, incolla tutto il contenuto di
    [`schema.sql`](schema.sql) e premi **Run**. Crea tabelle e permessi. Esegui poi anche
    [`migration_notifications.sql`](migration_notifications.sql) per attivare notifiche e preferenze granulari.
+   Poi [`migration_ore_compensi.sql`](migration_ore_compensi.sql): conteggio ore e compensi, richieste di
+   assenza, lezioni annullate in una data e grado "maestro caposcuola".
 3. Vai su **Authentication → Providers → Email** e **disattiva "Confirm email"**.
    Serve per far funzionare la registrazione al volo, senza dover controllare la posta: pensata
    per chi non è pratico di tecnologia.
