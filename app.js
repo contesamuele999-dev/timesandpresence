@@ -1720,6 +1720,24 @@ async function setAttendanceStatus(ref, dateStr, status){
   });
 }
 
+// Presenza segnata ma esclusa dai compensi. Su una presenza ricorrente crea la riga
+// esplicita di quel giorno, che vale come eccezione solo per quella data.
+async function setAttendanceUnpaid(ref, dateStr, unpaid){
+  if(isGuest()) return;
+  const state = myAttendanceState(ref, dateStr);
+  if(state!=='presente' && state!=='ricorrente') return toast('Prima segna la presenza.');
+  return runPresenceWrite('Presenza non retribuita', async ()=>{
+    const existing = findMyAttendance(ref, dateStr);
+    const data = existing
+      ? await checkedRow(sb.from('attendance').update({unpaid}).eq('id', existing.id).select())
+      : await checkedRow(sb.from('attendance').insert(Object.assign({date:dateStr, status:'presente', unpaid, instructor_id:myProfileId()}, ref)).select());
+    return ()=>{
+      S.attendance = existing ? S.attendance.map(a=>a.id===existing.id ? data : a) : S.attendance.concat(data);
+      toast(unpaid ? 'Presenza segnata come non retribuita.' : 'Presenza di nuovo retribuita.');
+    };
+  });
+}
+
 async function clearAttendance(ref, dateStr){
   const existing = findMyAttendance(ref, dateStr);
   if(!existing) return;
@@ -1836,10 +1854,13 @@ function computePayroll(data, pay, people, calendarFor){
     lessons.forEach(({row, ref})=>{
       const marks = data.attendance.filter(a=> a.date===dateStr && sameLesson(a, ref));
       const present = [];
+      const unpaid = new Set();   // presenti che hanno scelto di non farsi pagare questa lezione
       marks.forEach(a=>{
         if(a.status!=='presente') return;
-        if(a.instructor_id) present.push(person(a.instructor_id, 'Membro rimosso', 'istruttore'));
-        else present.push(person('g:'+a.guest_token, (a.guest_name||'Ospite')+' (ospite)', 'istruttore'));
+        const p = a.instructor_id ? person(a.instructor_id, 'Membro rimosso', 'istruttore')
+          : person('g:'+a.guest_token, (a.guest_name||'Ospite')+' (ospite)', 'istruttore');
+        present.push(p);
+        if(a.unpaid) unpaid.add(p);
       });
       if(ref.slot_id){
         const seen = new Set(marks.map(a=>a.instructor_id).filter(Boolean));
@@ -1854,17 +1875,20 @@ function computePayroll(data, pay, people, calendarFor){
       const hours = Math.max(0, minutesOf(row.end_time) - minutesOf(row.start_time))/60;
       const custom = pay.rates[rateKey(row.label)];
       const rate = custom!=null && custom!=='' ? Number(custom) : Number(pay.default_rate)||0;
-      const masters = pay.master_takes_all ? present.filter(p=> p.grade==='maestro') : [];
-      const paid = masters.length ? masters : present;
+      // chi non si fa pagare conta le ore ma non entra nella divisione del compenso
+      const candidates = present.filter(p=> !unpaid.has(p));
+      const masters = pay.master_takes_all ? candidates.filter(p=> p.grade==='maestro') : [];
+      const paid = masters.length ? masters : candidates;
       const share = paid.length>1 ? Number(pay.copresence_factor) : 1;
-      const note = masters.length && present.length>masters.length ? 'con maestro caposcuola'
+      const note = masters.length && candidates.length>masters.length ? 'con maestro caposcuola'
         : paid.length>1 ? `compresenza (${paid.length})` : '';
       present.forEach(p=>{
         const isPaid = paid.includes(p);
         const amount = isPaid ? round2(rate*hours*share) : 0;
         p.hours += hours; p.lessons++; p.amount = round2(p.amount+amount);
         if(isPaid) p.paidHours += hours;
-        p.entries.push({date:dateStr, label:row.label, start:row.start_time, end:row.end_time, hours, rate, amount, note});
+        p.entries.push({date:dateStr, label:row.label, start:row.start_time, end:row.end_time, hours, rate, amount,
+          note: unpaid.has(p) ? 'non retribuita' : note});
       });
     });
   });
@@ -2474,6 +2498,7 @@ async function restoreBackup(backup){
       if(!who){ skipped++; return; }
       if(!unique(['a', a.slot_id||'', a.extra_slot_id||'', who, a.date].join('|'))){ skipped++; return; }
       const row = {id:a.id, slot_id:a.slot_id||null, extra_slot_id:a.extra_slot_id||null, date:a.date, status:a.status, note:a.note||null};
+      if(a.unpaid) row.unpaid = true;
       if(a.guest_token){ row.guest_token = who; row.guest_name = a.guest_name||null; }
       else row.instructor_id = who;
       attendance.push(row);
@@ -3132,13 +3157,15 @@ function renderDayList(dt){
     const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
     const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
     const absence = myAbsenceRequest(it.ref, dateStr);
-    const absenceText = !absence ? '' : absence.status==='in_attesa' ? ' · ⏳ assenza richiesta' : absence.status==='approvata' ? ' · assenza approvata' : ' · assenza rifiutata';
+    const myRow = findMyAttendance(it.ref, dateStr);
+    const unpaidText = myRow && myRow.unpaid && myRow.status==='presente' ? ' · non retribuita' : '';
+    const absenceText = unpaidText + (!absence ? '' : absence.status==='in_attesa' ? ' · ⏳ assenza richiesta' : absence.status==='approvata' ? ' · assenza approvata' : ' · assenza rifiutata');
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
       <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
-      ${!isGuest() ? `<button class="btn ghost sm morebtn" title="Altre azioni: richiesta di assenza${isAdmin()?', annulla lezione':''}" aria-label="Altre azioni">⋯</button>` : ''}
+      ${!isGuest() ? `<button class="btn ghost sm morebtn" title="Altre azioni: presenza non retribuita, richiesta di assenza${isAdmin()?', annulla lezione':''}" aria-label="Altre azioni">⋯</button>` : ''}
       ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
       ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Ripeti lo stato ogni settimana su questo orario" ${presenceControlsDisabled() ? 'disabled' : ''}>🔁</button>` : ''}
       <button class="togglebtn ${btnClass}" ${presenceControlsDisabled() ? 'disabled' : ''}>${btnLabel}</button>
@@ -3878,12 +3905,19 @@ function renderModal(){
     const [y,mo,dd] = m.date.split('-').map(Number);
     const dateLabel = `${WEEKDAYS[(new Date(y,mo-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[mo-1]} ${y}`;
     const req = myAbsenceRequest(m.ref, m.date);
+    const myState = myAttendanceState(m.ref, m.date);
+    const canUnpaid = myState==='presente' || myState==='ricorrente';
+    const myMark = findMyAttendance(m.ref, m.date);
+    const unpaidOn = canUnpaid && !!(myMark && myMark.unpaid);
     const canAsk = !req || req.status==='rifiutata';
     const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
     box.innerHTML = `
       <div class="mhead"><h2>${esc(m.label)}</h2><button id="x">✕</button></div>
       <p class="hint" style="margin:0 0 14px">${esc(fmtHM(m.start))}–${esc(fmtHM(m.end))} · ${dateLabel}</p>
-      <h3>Richiesta di assenza</h3>
+      <h3>Compenso</h3>
+      <label class="checkrow"><input type="checkbox" id="up_toggle" ${unpaidOn?'checked':''} ${canUnpaid && !presenceControlsDisabled()?'':'disabled'}>
+        <span><b>Presenza non retribuita</b><small>${canUnpaid ? 'Risulti presente e le ore si contano, ma questa lezione non entra nei compensi.' : 'Segna prima la presenza a questa lezione.'}</small></span></label>
+      <h3 style="margin-top:18px">Richiesta di assenza</h3>
       ${canAsk ? `
         ${req ? '<p class="hint" style="margin:0 0 8px">La richiesta precedente è stata rifiutata.</p>' : ''}
         <label class="field"><span>Motivo (facoltativo)</span><input type="text" id="ab_reason" placeholder="Es. visita medica"></label>
@@ -3905,6 +3939,7 @@ function renderModal(){
           </div>
         </div>
         <button class="btn danger block" id="cl_go">Annulla lezione</button>` : ''}`;
+    box.querySelector('#up_toggle').onchange = e=> setAttendanceUnpaid(m.ref, m.date, e.target.checked);
     const send = box.querySelector('#ab_send');
     if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim());
     const withdraw = box.querySelector('#ab_withdraw');

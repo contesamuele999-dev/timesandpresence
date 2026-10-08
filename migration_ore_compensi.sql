@@ -34,6 +34,9 @@ drop trigger if exists guard_profile_privileges on profiles;
 create trigger guard_profile_privileges before update on profiles
   for each row execute function guard_profile_privileges();
 
+-- ---------- PRESENZA NON RETRIBUITA (l'istruttore c'è ma la lezione non entra nei compensi) ----------
+alter table attendance add column if not exists unpaid boolean not null default false;
+
 -- ---------- REGOLE COMPENSI (una riga per spazio) ----------
 create table if not exists pay_settings (
   workspace_id uuid primary key references workspaces(id) on delete cascade,

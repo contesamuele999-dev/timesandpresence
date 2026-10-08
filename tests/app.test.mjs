@@ -230,6 +230,16 @@ test('compensi: tariffa piena, compresenza a 2/3, maestro prende tutto, annullat
   assert.equal(master.m.amount, 30);
   assert.equal(master.a.amount, 0);
   assert.equal(master.a.hours, 1.5);
+  // presenza non retribuita: ore contate, compenso zero, l'altro torna a tariffa piena
+  const volunteer = run(data([present('a', '2026-09-07'), { ...present('b', '2026-09-07'), unpaid: true }]));
+  assert.equal(volunteer.a.amount, 30);
+  assert.equal(volunteer.b.amount, 0);
+  assert.equal(volunteer.b.hours, 1.5);
+  assert.equal(volunteer.b.entries[0].note, 'non retribuita');
+  // un maestro non retribuito non toglie il compenso agli istruttori
+  const freeMaster = run(data([present('a', '2026-09-07'), { ...present('m', '2026-09-07'), unpaid: true }]));
+  assert.equal(freeMaster.a.amount, 30);
+  assert.equal(freeMaster.m.amount, 0);
   // regola disattivata: anche il maestro è in compresenza
   const off = run(data([present('a', '2026-09-07'), present('m', '2026-09-07')]), { ...pay, master_takes_all: false });
   assert.equal(off.m.amount, 20);
