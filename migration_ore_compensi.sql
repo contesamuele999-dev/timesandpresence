@@ -12,6 +12,13 @@ alter table profiles add column if not exists grade text not null default 'istru
 alter table profiles drop constraint if exists profiles_grade_check;
 alter table profiles add constraint profiles_grade_check check (grade in ('istruttore','maestro'));
 
+-- Modo di pagamento: a ore (calcolato dalle presenze) o a forfait (fisso mensile, fuori dal
+-- conteggio). Il modo è visibile a tutti perché cambia la divisione in compresenza;
+-- l'importo sta in pay_forfaits e lo vedono solo l'interessato e gli admin.
+alter table profiles add column if not exists pay_mode text not null default 'ore';
+alter table profiles drop constraint if exists profiles_pay_mode_check;
+alter table profiles add constraint profiles_pay_mode_check check (pay_mode in ('ore','forfait'));
+
 -- Ruolo e grado decidono permessi e compensi: li cambia solo un amministratore.
 -- (pr_update_self consente a ognuno di modificare la propria riga, foto e nome inclusi.)
 create or replace function guard_profile_privileges()
@@ -22,7 +29,8 @@ set search_path = public
 as $$
 begin
   if auth.uid() is not null
-     and (new.role is distinct from old.role or new.grade is distinct from old.grade)
+     and (new.role is distinct from old.role or new.grade is distinct from old.grade
+          or new.pay_mode is distinct from old.pay_mode)
      and coalesce(my_role_in(old.workspace_id), '') <> 'admin' then
     raise exception 'Solo un amministratore può cambiare ruolo o grado' using errcode = '42501';
   end if;
@@ -55,6 +63,30 @@ create policy ps_insert on pay_settings for insert with check (my_role_in(worksp
 drop policy if exists ps_update on pay_settings;
 create policy ps_update on pay_settings for update using (my_role_in(workspace_id) = 'admin');
 grant select, insert, update on pay_settings to authenticated;
+
+-- ---------- FORFAIT MENSILE (importo riservato) ----------
+create table if not exists pay_forfaits (
+  profile_id uuid primary key references profiles(id) on delete cascade,
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  monthly_amount numeric(10,2) not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+alter table pay_forfaits enable row level security;
+drop policy if exists pf_select on pay_forfaits;
+create policy pf_select on pay_forfaits for select using (
+  is_my_profile(profile_id) or my_role_in(workspace_id) = 'admin'
+);
+drop policy if exists pf_insert on pay_forfaits;
+create policy pf_insert on pay_forfaits for insert with check (
+  my_role_in(workspace_id) = 'admin'
+  and exists (select 1 from profiles p where p.id = profile_id and p.workspace_id = pay_forfaits.workspace_id)
+);
+drop policy if exists pf_update on pay_forfaits;
+create policy pf_update on pay_forfaits for update using (my_role_in(workspace_id) = 'admin');
+drop policy if exists pf_delete on pay_forfaits;
+create policy pf_delete on pay_forfaits for delete using (my_role_in(workspace_id) = 'admin');
+grant select, insert, update, delete on pay_forfaits to authenticated;
 
 -- ---------- PRESENZE RICORRENTI CON STORICO ----------
 -- Prima la ricorrenza valeva solo dalla settimana corrente in avanti, quindi le

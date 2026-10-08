@@ -121,6 +121,18 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
     await db.query(`update profiles set name = 'Nuovo nome' where id = '${ids.profile}'`);
   });
 
+  await scenario('forfait: importo riservato, modo deciso solo da un admin', async () => {
+    await asUser();
+    await fails(`update profiles set pay_mode = 'forfait' where id = '${ids.profile}'`, /amministratore/);
+    await fails(`insert into pay_forfaits (profile_id, workspace_id, monthly_amount) values ('${ids.profile}', '${ids.ws}', 500)`, /row-level security/);
+    await asUser(ids.other);
+    await db.query(`update profiles set pay_mode = 'forfait' where id = '${ids.profile}'`);
+    await db.query(`insert into pay_forfaits (profile_id, workspace_id, monthly_amount) values ('${ids.profile}', '${ids.ws}', 500), ('${ids.admin}', '${ids.ws}', 900)`);
+    await asUser();
+    const { rows } = await db.query('select profile_id, monthly_amount from pay_forfaits');
+    assert.deepEqual(rows.map(r => r.profile_id), [ids.profile]);
+  });
+
   await scenario('un admin assegna il grado maestro', async () => {
     await asUser(ids.other);
     const { rows } = await db.query(`update profiles set grade = 'maestro' where id = '${ids.profile}' returning grade`);

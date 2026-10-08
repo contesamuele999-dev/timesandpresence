@@ -1835,6 +1835,14 @@ function fmtHours(h){ return (h||0).toLocaleString('it-IT', {maximumFractionDigi
    Regole: da solo prende la tariffa piena; in compresenza ognuno prende
    copresence_factor della tariffa; se c'è un maestro caposcuola (e la regola è attiva)
    il compenso va solo ai maestri presenti, gli altri contano le ore ma non il compenso. */
+// Fisso mensile ripartito a giorni: un mese intero vale l'importo pieno,
+// una settimana o un mese ancora in corso la sua parte.
+function forfaitFor(monthly, from, to){
+  let total = 0;
+  datesBetween(from, to).forEach(d=>{ const [y,m] = d.split('-').map(Number); total += monthly / new Date(y, m, 0).getDate(); });
+  return round2(total);
+}
+
 function computePayroll(data, pay, people, calendarFor){
   pay = Object.assign({}, DEFAULT_PAY, pay||{});
   const byKey = new Map();
@@ -1842,7 +1850,7 @@ function computePayroll(data, pay, people, calendarFor){
     if(!byKey.has(key)) byKey.set(key, {key, name, grade, hours:0, paidHours:0, amount:0, lessons:0, entries:[]});
     return byKey.get(key);
   };
-  people.forEach(p=> person(p.id, p.name, p.grade||'istruttore'));
+  people.forEach(p=> person(p.id, p.name, p.grade||'istruttore').forfaitMode = p.pay_mode==='forfait');
   datesBetween(data.from, data.to).forEach(dateStr=>{
     const [y,m,d] = dateStr.split('-').map(Number);
     const wd = (new Date(y, m-1, d).getDay()+6)%7;
@@ -1860,7 +1868,7 @@ function computePayroll(data, pay, people, calendarFor){
         const p = a.instructor_id ? person(a.instructor_id, 'Membro rimosso', 'istruttore')
           : person('g:'+a.guest_token, (a.guest_name||'Ospite')+' (ospite)', 'istruttore');
         present.push(p);
-        if(a.unpaid) unpaid.add(p);
+        if(a.unpaid || p.forfaitMode) unpaid.add(p);
       });
       if(ref.slot_id){
         const seen = new Set(marks.map(a=>a.instructor_id).filter(Boolean));
@@ -1868,7 +1876,9 @@ function computePayroll(data, pay, people, calendarFor){
           if(r.slot_id!==ref.slot_id || seen.has(r.instructor_id) || !byKey.has(r.instructor_id)) return;
           if(recurringStatusOn(ref.slot_id, r.instructor_id, dateStr, data.recurring)!=='presente') return;
           seen.add(r.instructor_id);
-          present.push(byKey.get(r.instructor_id));
+          const p = byKey.get(r.instructor_id);
+          present.push(p);
+          if(p.forfaitMode) unpaid.add(p);
         });
       }
       if(!present.length) return;
@@ -1888,9 +1898,17 @@ function computePayroll(data, pay, people, calendarFor){
         p.hours += hours; p.lessons++; p.amount = round2(p.amount+amount);
         if(isPaid) p.paidHours += hours;
         p.entries.push({date:dateStr, label:row.label, start:row.start_time, end:row.end_time, hours, rate, amount,
-          note: unpaid.has(p) ? 'non retribuita' : note});
+          note: p.forfaitMode ? 'a forfait' : unpaid.has(p) ? 'non retribuita' : note});
       });
     });
+  });
+  // il forfait si aggiunge una volta per periodo, non per lezione
+  const monthly = new Map((data.forfaits||[]).map(f=>[f.profile_id, Number(f.monthly_amount)||0]));
+  byKey.forEach(p=>{
+    if(!p.forfaitMode) return;
+    p.forfaitMonthly = monthly.has(p.key) ? monthly.get(p.key) : null; // null = importo non visibile
+    p.forfait = p.forfaitMonthly ? forfaitFor(p.forfaitMonthly, data.from, data.to) : 0;
+    p.amount = round2(p.amount + p.forfait);
   });
   return Array.from(byKey.values()).sort((a,b)=> a.name.localeCompare(b.name));
 }
@@ -1929,15 +1947,16 @@ async function loadReport(){
     ]);
     const slotIds = slots.map(x=>x.id), extraIds = extras.map(x=>x.id);
     const dated = (table, column, ids)=> ids.length ? softRows(sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
-    const [att, extraAtt, recurring, cancellations] = await Promise.all([
+    const [att, extraAtt, recurring, cancellations, forfaits] = await Promise.all([
       dated('attendance', 'slot_id', slotIds),
       dated('attendance', 'extra_slot_id', extraIds),
       slotIds.length ? checkedRows(sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
       dated('lesson_cancellations', 'slot_id', slotIds),
+      softRows(sb.from('pay_forfaits').select('*').eq('workspace_id', wsId)),
     ]);
     if(S.workspace?.id!==wsId || key!==[wsId, ...Object.values(reportRange())].join('|')) return;
     S.paySettings = Object.assign({}, DEFAULT_PAY, settings[0]||{});
-    S.reportData = {from, to, slots, extras, attendance:att.concat(extraAtt), recurring, cancellations};
+    S.reportData = {from, to, slots, extras, attendance:att.concat(extraAtt), recurring, cancellations, forfaits};
   }catch(error){
     if(S.workspace?.id===wsId) showDataError(error, 'Caricamento ore');
   }finally{
@@ -1945,15 +1964,34 @@ async function loadReport(){
   }
 }
 
-async function savePaySettings(values){
+// people: [{id, mode:'ore'|'forfait', amount}] solo per chi è cambiato
+async function savePaySettings(values, people=[]){
   if(!isAdmin()) return;
+  const wsId = S.workspace.id;
   try{
     const row = await checkedRow(sb.from('pay_settings').upsert(Object.assign(
-      {workspace_id:S.workspace.id, updated_at:new Date().toISOString()}, values), {onConflict:'workspace_id'}).select());
+      {workspace_id:wsId, updated_at:new Date().toISOString()}, values), {onConflict:'workspace_id'}).select());
     S.paySettings = Object.assign({}, DEFAULT_PAY, row);
+    for(const p of people){
+      await checkedRow(sb.from('profiles').update({pay_mode:p.mode}).eq('id', p.id).eq('workspace_id', wsId).select('id'));
+      if(p.mode==='forfait') await checkedRow(sb.from('pay_forfaits').upsert({profile_id:p.id, workspace_id:wsId,
+        monthly_amount:p.amount, updated_at:new Date().toISOString()}, {onConflict:'profile_id'}).select());
+      else await checkedRows(sb.from('pay_forfaits').delete().eq('profile_id', p.id));
+    }
     toast('Regole compensi salvate.');
     closeModal();
-  }catch(error){ showDataError(error, 'Salvataggio regole compensi'); closeModal(); }
+    if(people.length){ await loadInstructors(); await loadReport(); }
+  }catch(error){ closeModal(); showDataError(error, 'Salvataggio regole compensi'); }
+}
+
+// Stampa (o PDF nell'APK) di quello che la scheda Ore mostra in questo momento.
+async function printReport(title){
+  const native = nativeNotifications();
+  if(!native) return window.print();
+  // nell'APK window.print() non fa nulla: usiamo la stampa di Android (anche "Salva come PDF")
+  if(!native.printPage) return toast('Aggiorna l’app per stampare o salvare in PDF.');
+  try{ await native.printPage(title); }
+  catch(e){ console.error('Presencer: stampa', e); toast('Stampa non disponibile su questo dispositivo.'); }
 }
 
 function reportCsv(rows, from, to){
@@ -1961,6 +1999,7 @@ function reportCsv(rows, from, to){
   const num = n=> String(round2(n)).replace('.', ',');
   const lines = [['Persona','Data','Lezione','Inizio','Fine','Ore','Tariffa €/h','Compenso €','Nota'].map(cell).join(';')];
   rows.forEach(p=> p.entries.forEach(e=> lines.push([p.name, e.date, e.label, fmtHM(e.start), fmtHM(e.end), num(e.hours), num(e.rate), num(e.amount), e.note].map(cell).join(';'))));
+  rows.forEach(p=>{ if(p.forfait) lines.push([p.name, from+' / '+to, 'Forfait '+num(p.forfaitMonthly)+' €/mese', '', '', '', '', num(p.forfait), ''].map(cell).join(';')); });
   rows.forEach(p=> lines.push([p.name+' TOTALE', from+' / '+to, '', '', '', num(p.hours), '', num(p.amount), p.lessons+' lezioni'].map(cell).join(';')));
   // BOM: senza, Excel apre gli accenti come caratteri strani
   return '\ufeff' + lines.join('\r\n');
@@ -3260,6 +3299,7 @@ function renderOre(){
   const data = S.reportData && S.reportData.from===from && S.reportData.to===to ? S.reportData : null;
   const today = todayISO();
   const fmtDate = iso=>{ const [y,m,dd] = iso.split('-').map(Number); return `${dd} ${MONTHS[m-1]} ${y}`; };
+  const printName = isAdmin() ? (S.instructors.find(p=>p.id===S.reportPerson)||{}).name : myName();
   const periodLabel = S.reportMode==='month'
     ? new Date(+from.slice(0,4), +from.slice(5,7)-1, 1).toLocaleDateString('it-IT', {month:'long', year:'numeric'})
     : `${fmtDate(from)} – ${fmtDate(to)}`;
@@ -3287,7 +3327,7 @@ function renderOre(){
         <div class="wk">${esc(periodLabel)}<small>${to>today ? 'Contate le lezioni fino a oggi' : 'Periodo concluso'}</small></div>
         <button class="arrow" id="repNext" aria-label="Periodo successivo">›</button>
       </div>`}
-    <div class="printonly"><h2>${esc(S.workspace.name)} · Ore e compensi</h2><p>${esc(periodLabel)}${to>today ? ' (fino al '+esc(fmtDate(today))+')' : ''}</p></div>
+    <div class="printonly"><h2>${esc(S.workspace.name)} · Ore e compensi${printName ? ' · '+esc(printName) : ''}</h2><p>${esc(periodLabel)}${to>today ? ' (fino al '+esc(fmtDate(today))+')' : ''}</p></div>
     <div id="repHost"></div>`;
 
   d.querySelectorAll('#repMode button').forEach(b=> b.onclick = ()=>{
@@ -3329,9 +3369,9 @@ function renderOre(){
   summary.className = 'card';
   summary.innerHTML = `
     <table class="report">
-      <thead><tr><th>Persona</th><th>Lezioni</th><th>Ore</th><th>Compenso</th></tr></thead>
-      <tbody>${rows.map(p=>`<tr><td>${esc(p.name)}${p.grade==='maestro'?' <span class="tag">Maestro</span>':''}</td><td>${p.lessons}</td><td>${fmtHours(p.hours)}</td><td>${euro(p.amount)}</td></tr>`).join('') || '<tr><td colspan="4" class="hint">Nessuna lezione nel periodo.</td></tr>'}</tbody>
-      ${rows.length>1 ? `<tfoot><tr><td>Totale</td><td>${tot.lessons}</td><td>${fmtHours(tot.hours)}</td><td>${euro(tot.amount)}</td></tr></tfoot>` : ''}
+      <thead><tr><th>Persona</th><th>Lezioni</th><th>Ore</th><th>Compenso</th>${isAdmin() && rows.length>1 ? '<th class="noprint"></th>' : ''}</tr></thead>
+      <tbody>${rows.map(p=>`<tr><td>${esc(p.name)}${p.grade==='maestro'?' <span class="tag">Maestro</span>':''}${p.forfaitMode?' <span class="tag">Forfait</span>':''}</td><td>${p.lessons}</td><td>${fmtHours(p.hours)}</td><td>${p.forfaitMode && p.forfaitMonthly==null ? '—' : euro(p.amount)}</td>${isAdmin() && rows.length>1 ? `<td class="noprint">${p.key.startsWith('g:') ? '' : `<button class="btn ghost sm" data-print="${esc(p.key)}" title="Stampa o salva in PDF il resoconto di ${esc(p.name)}">🖨</button>`}</td>` : ''}</tr>`).join('') || '<tr><td colspan="4" class="hint">Nessuna lezione nel periodo.</td></tr>'}</tbody>
+      ${rows.length>1 ? `<tfoot><tr><td>Totale</td><td>${tot.lessons}</td><td>${fmtHours(tot.hours)}</td><td>${euro(tot.amount)}</td>${isAdmin() ? '<td class="noprint"></td>' : ''}</tr></tfoot>` : ''}
     </table>
     <div class="row noprint" style="margin-top:12px">
       <label class="checkrow" style="margin:0"><input type="checkbox" id="repDetail" ${S.reportDetail?'checked':''}><span>Dettaglio lezioni</span></label>
@@ -3341,26 +3381,29 @@ function renderOre(){
     </div>
     ${S.paySettings && !S.paySettings.default_rate && !Object.keys(S.paySettings.rates||{}).length ? `<p class="hint noprint">Nessuna tariffa impostata: i compensi risultano 0. ${isAdmin()?'Impostale da “Regole e tariffe”.':'Chiedi all’amministratore di impostarle.'}</p>` : ''}`;
   summary.querySelector('#repDetail').onchange = e=>{ S.reportDetail = e.target.checked; render(); };
-  summary.querySelector('#repPrint').onclick = async ()=>{
-    // nell'APK window.print() non fa nulla: usiamo la stampa di Android (anche "Salva come PDF")
-    const native = nativeNotifications();
-    if(!native) return window.print();
-    if(!native.printPage) return toast('Aggiorna l’app per stampare o salvare in PDF.');
-    try{ await native.printPage(`Ore ${from} - ${upTo}`); }
-    catch(e){ console.error('Presencer: stampa', e); toast('Stampa non disponibile su questo dispositivo.'); }
-  };
+  summary.querySelector('#repPrint').onclick = ()=> printReport(`Ore ${printName ? printName+' ' : ''}${from} - ${upTo}`);
+  // Foglio di una sola persona: filtro su di lei con il dettaglio, poi stampa.
+  // Il filtro resta attivo: la stampa di Android legge la pagina mentre il dialogo è aperto.
+  summary.querySelectorAll('[data-print]').forEach(b=> b.onclick = async ()=>{
+    const who = S.instructors.find(p=>p.id===b.dataset.print);
+    S.reportPerson = b.dataset.print; S.reportDetail = true;
+    render();
+    await new Promise(r=> setTimeout(r, 60));
+    printReport(`Ore ${who ? who.name : ''} ${from} - ${upTo}`);
+  });
   summary.querySelector('#repCsv').onclick = ()=>{
     const name = `ore-${from}-${upTo}.csv`;
     if(!downloadText(name, reportCsv(rows, from, upTo), 'text/csv;charset=utf-8')) toast('Download non riuscito.');
   };
   host.appendChild(summary);
 
-  if(S.reportDetail) rows.filter(p=>p.entries.length).forEach(p=>{
+  if(S.reportDetail) rows.filter(p=>p.entries.length || p.forfait).forEach(p=>{
     const card = document.createElement('div');
     card.className = 'card report-detail';
     card.innerHTML = `<h3>${esc(p.name)}</h3>
       <table class="report"><thead><tr><th>Data</th><th>Lezione</th><th>Ore</th><th>Compenso</th></tr></thead><tbody>
       ${p.entries.map(e=>{ const [y,m,dd] = e.date.split('-').map(Number); return `<tr><td>${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}</td><td>${esc(e.label)} <span class="hint">${fmtHM(e.start)}–${fmtHM(e.end)}${e.note?' · '+esc(e.note):''}</span></td><td>${fmtHours(e.hours)}</td><td>${euro(e.amount)}</td></tr>`; }).join('')}
+      ${p.forfait ? `<tr><td colspan="3">Forfait ${euro(p.forfaitMonthly)}/mese · quota del periodo</td><td>${euro(p.forfait)}</td></tr>` : ''}
       </tbody><tfoot><tr><td colspan="2">Totale</td><td>${fmtHours(p.hours)}</td><td>${euro(p.amount)}</td></tr></tfoot></table>`;
     host.appendChild(card);
   });
@@ -3958,6 +4001,7 @@ function renderModal(){
 
   else if(m.type==='pay-settings'){
     const pay = Object.assign({}, DEFAULT_PAY, S.paySettings||{});
+    const forfaits = S.reportData && S.reportData.forfaits || [];
     // i tipi di lezione sono le etichette usate negli orari e nelle lezioni extra
     const labels = Array.from(new Map(S.slots.concat(S.reportData ? S.reportData.extras : [])
       .map(x=>[rateKey(x.label), x.label.trim()])).entries()).filter(([k])=>k).sort((a,b)=>a[1].localeCompare(b[1]));
@@ -3971,14 +4015,38 @@ function renderModal(){
       <label class="field rate"><span>Compresenza: quota della tariffa a testa</span><input type="number" min="0" max="100" step="0.01" inputmode="decimal" id="pr_factor" value="${round2(pay.copresence_factor*100)}"> %</label>
       <p class="hint" style="margin:-6px 0 12px">66,67% = 2/3 della tariffa a ciascuno. 50% con due istruttori = tariffa divisa a metà.</p>
       <label class="checkrow"><input type="checkbox" id="pr_master" ${pay.master_takes_all?'checked':''}><span><b>Il maestro caposcuola prende tutto</b><small>Se è presente, il compenso della lezione va solo a lui e non si divide con gli istruttori.</small></span></label>
+      <h3 style="margin-top:18px">Compenso per persona</h3>
+      <p class="hint" style="margin:0 0 10px">A forfait = esclusa dal conteggio a ore: prende il fisso mensile (a giorni nei periodi parziali) e non riduce la quota degli altri in compresenza. L'importo lo vedono solo lei e gli admin.</p>
+      ${S.instructors.map((p,i)=>{
+        const f = forfaits.find(x=>x.profile_id===p.id);
+        const on = p.pay_mode==='forfait';
+        return `<label class="field rate" data-person="${esc(p.id)}"><span>${esc(p.name)}</span>
+          <select id="pm_${i}" data-mode style="width:auto">${['ore','forfait'].map(v=>`<option value="${v}" ${(on?'forfait':'ore')===v?'selected':''}>${v==='ore'?'A ore':'A forfait'}</option>`).join('')}</select>
+          <input type="number" min="0" step="1" inputmode="decimal" id="pf_${i}" data-amount value="${f ? esc(f.monthly_amount) : ''}" placeholder="€/mese" class="${on?'':'hidden'}"> <span class="${on?'':'hidden'}" data-unit style="flex:0;margin:0">€/mese</span></label>`;
+      }).join('')}
       <button class="btn block" id="pr_save">Salva</button>`;
+    box.querySelectorAll('[data-person]').forEach(row=>{
+      row.querySelector('[data-mode]').onchange = e=>{
+        const on = e.target.value==='forfait';
+        row.querySelector('[data-amount]').classList.toggle('hidden', !on);
+        row.querySelector('[data-unit]').classList.toggle('hidden', !on);
+      };
+    });
     box.querySelector('#pr_save').onclick = ()=>{
       const rates = {};
       box.querySelectorAll('[data-rate]').forEach(i=>{ if(i.value!=='') rates[i.dataset.rate] = Math.max(0, Number(i.value)); });
       const factor = Number(box.querySelector('#pr_factor').value);
       if(!(factor>=0 && factor<=100)) return toast('La quota di compresenza va da 0 a 100%.');
+      const people = [];
+      box.querySelectorAll('[data-person]').forEach(row=>{
+        const p = S.instructors.find(x=>x.id===row.dataset.person);
+        const mode = row.querySelector('[data-mode]').value;
+        const amount = Math.max(0, Number(row.querySelector('[data-amount]').value)||0);
+        const before = forfaits.find(x=>x.profile_id===p.id);
+        if(mode!==(p.pay_mode||'ore') || (mode==='forfait' && (!before || Number(before.monthly_amount)!==amount))) people.push({id:p.id, mode, amount});
+      });
       savePaySettings({rates, default_rate:Math.max(0, Number(box.querySelector('#pr_default').value)||0),
-        copresence_factor:round2(factor)/100, master_takes_all:box.querySelector('#pr_master').checked});
+        copresence_factor:round2(factor)/100, master_takes_all:box.querySelector('#pr_master').checked}, people);
     };
   }
 

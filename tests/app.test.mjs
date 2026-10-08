@@ -240,6 +240,16 @@ test('compensi: tariffa piena, compresenza a 2/3, maestro prende tutto, annullat
   const freeMaster = run(data([present('a', '2026-09-07'), { ...present('m', '2026-09-07'), unpaid: true }]));
   assert.equal(freeMaster.a.amount, 30);
   assert.equal(freeMaster.m.amount, 0);
+  // a forfait: fuori dalla divisione, prende il fisso (mese intero = importo pieno)
+  const forfaitPeople = people.map(p => p.id === 'b' ? { ...p, pay_mode: 'forfait' } : p);
+  const fx = Object.fromEntries(app.computePayroll({ ...data([present('a', '2026-09-07'), present('b', '2026-09-07')]),
+    from: '2026-09-01', to: '2026-09-30', forfaits: [{ profile_id: 'b', monthly_amount: 600 }] }, pay, forfaitPeople, () => 'cal').map(r => [r.key, r]));
+  assert.equal(fx.a.amount, 30);
+  assert.equal(fx.b.amount, 600);
+  assert.equal(fx.b.hours, 1.5);
+  assert.equal(fx.b.entries[0].note, 'a forfait');
+  // settimana: 7 giorni su 30
+  assert.equal(app.forfaitFor(600, '2026-09-07', '2026-09-13'), 140);
   // regola disattivata: anche il maestro è in compresenza
   const off = run(data([present('a', '2026-09-07'), present('m', '2026-09-07')]), { ...pay, master_takes_all: false });
   assert.equal(off.m.amount, 20);
