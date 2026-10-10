@@ -3203,8 +3203,7 @@ function renderDayList(dt){
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
-      <div class="info"><div class="lbl">${esc(it.label)}</div><div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
-      ${!isGuest() ? `<button class="btn ghost sm morebtn" title="Altre azioni: presenza non retribuita, richiesta di assenza${isAdmin()?', annulla lezione':''}" aria-label="Altre azioni">⋯</button>` : ''}
+      <div class="info">${!isGuest() ? `<button class="lbl morebtn" title="Altre azioni: presenza non retribuita, richiesta di assenza${isAdmin()?', annulla lezione':''}">${esc(it.label)}</button>` : `<div class="lbl">${esc(it.label)}</div>`}<div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
       ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
       ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Ripeti lo stato ogni settimana su questo orario" ${presenceControlsDisabled() ? 'disabled' : ''}>🔁</button>` : ''}
       <button class="togglebtn ${btnClass}" ${presenceControlsDisabled() ? 'disabled' : ''}>${btnLabel}</button>
