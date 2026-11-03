@@ -138,7 +138,11 @@ const authStorage = {
   removeItem: (k)=>{ localStorage.removeItem(k); sessionStorage.removeItem(k); },
 };
 
+// L'APK è già l'app installata: la sua WebView non dichiara display-mode standalone
+// e ha un user agent Android/Chrome, quindi senza questo controllo proporrebbe di installarsi.
 function isStandalone(){
+  if(window.PresencerNative && window.PresencerNative.isNative) return true;
+  if(/; wv\)/.test(navigator.userAgent || '')) return true; // WebView di un'app: non può installare PWA
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 }
 // 'prompt' = prompt nativo disponibile (beforeinstallprompt già arrivato);

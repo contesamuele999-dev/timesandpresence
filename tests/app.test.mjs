@@ -345,3 +345,15 @@ test('sostituzione: il collega proposto accetta e la richiesta si aggiorna', asy
   assert.equal(insert.payload.substitute_id, 'other');
   assert.equal(insert.payload.substitute_status, 'proposta');
 });
+
+test("nell'APK non propone di installare l'app", () => {
+  const { app } = appWith();
+  app.window.matchMedia = () => ({ matches: false });
+  app.window.navigator = app.navigator;
+  app.navigator.userAgent = 'Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/AP2A; wv) AppleWebKit/537.36 Chrome/129.0 Mobile Safari/537.36';
+  assert.equal(app.installMode(), null);
+  app.navigator.userAgent = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/129.0 Mobile Safari/537.36';
+  assert.equal(app.installMode(), 'android');
+  app.window.PresencerNative = { isNative: true };
+  assert.equal(app.installMode(), null);
+});
