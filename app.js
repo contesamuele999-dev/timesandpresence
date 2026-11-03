@@ -579,6 +579,18 @@ async function checkedRows(query){
   return data || [];
 }
 
+// Supabase restituisce al massimo 1000 righe per richiesta, senza errore: su periodi
+// lunghi (ore, backup) il resto sparirebbe in silenzio. build() crea una query nuova a ogni pagina.
+const PAGE_ROWS = 1000;
+async function allRows(build){
+  const out = [];
+  for(let from = 0; ; from += PAGE_ROWS){
+    const page = await checkedRows(build().order('id').range(from, from + PAGE_ROWS - 1));
+    out.push(...page);
+    if(page.length < PAGE_ROWS) return out;
+  }
+}
+
 async function checkedRow(query){
   const {data, error} = await query.single();
   if(error) throw error;
@@ -1639,10 +1651,20 @@ function mondayISOOf(value){
 function recurringCovers(r, dateStr){
   return dateStr >= mondayISOOf(r.created_at) && (!r.ended_on || dateStr < r.ended_on);
 }
+function recurringOn(slotId, instructorId, dateStr, recurring=S.recurring){
+  return recurring.find(x=>x.slot_id===slotId && x.instructor_id===instructorId && recurringCovers(x, dateStr)) || null;
+}
 // stato replicato dalla ricorrenza in quella data ('presente' | 'assente'), o null
 function recurringStatusOn(slotId, instructorId, dateStr, recurring=S.recurring){
-  const r = recurring.find(x=>x.slot_id===slotId && x.instructor_id===instructorId && recurringCovers(x, dateStr));
+  const r = recurringOn(slotId, instructorId, dateStr, recurring);
   return r ? (r.status || 'presente') : null;
+}
+// "non retribuita" in quella data: la riga del giorno vince sulla ricorrenza
+function myUnpaidOn(ref, dateStr){
+  const row = findMyAttendance(ref, dateStr);
+  if(row) return row.status==='presente' && !!row.unpaid;
+  const r = ref.slot_id && !isGuest() ? recurringOn(ref.slot_id, myProfileId(), dateStr) : null;
+  return !!(r && (r.status||'presente')==='presente' && r.unpaid);
 }
 
 // stato "effettivo" per me su uno slot/data: riga esplicita se c'è, altrimenti presenza
@@ -1783,12 +1805,40 @@ async function toggleRecurring(ref, slotId, dateStr){
     // di default 'presente' se non ancora segnato.
     const cur = findMyAttendance(ref, dateStr);
     const status = cur ? cur.status : 'presente';
-    const data = await checkedRow(sb.from('recurring_presence').insert({slot_id:slotId, instructor_id:myProfileId(), status}).select());
+    const row = {slot_id:slotId, instructor_id:myProfileId(), status};
+    if(cur && cur.unpaid && status==='presente') row.unpaid = true;
+    const data = await checkedRow(sb.from('recurring_presence').insert(row).select());
     return ()=>{
       S.recurring.push(data);
-      toast('Presenza ricorrente attivata: segnato "'+status+'" ogni settimana su questo orario.');
+      toast('Presenza ricorrente attivata: segnato "'+status+(row.unpaid ? ' non retribuita' : '')+'" ogni settimana su questo orario.');
     };
   });
+}
+
+// Non retribuita ogni settimana. Senza ricorrenza la crea (presente); su una ricorrenza
+// nata prima di questa settimana la chiude e ne apre una nuova, così le settimane
+// passate restano pagate com'erano.
+async function setRecurringUnpaid(slotId, unpaid){
+  if(isGuest()) return;
+  return runPresenceWrite('Non retribuita ricorrente', async ()=>{
+    const existing = activeRecurring(slotId, myProfileId());
+    const thisMonday = toISO(mondayOf(0));
+    let closed = null;
+    if(existing && mondayISOOf(existing.created_at) >= thisMonday){
+      const data = await checkedRow(sb.from('recurring_presence').update({unpaid}).eq('id', existing.id).select());
+      return ()=>{ S.recurring = S.recurring.map(r=>r.id===existing.id ? data : r); toast(unpaidToast(unpaid)); };
+    }
+    if(existing) closed = await checkedRow(sb.from('recurring_presence').update({ended_on:thisMonday}).eq('id', existing.id).select());
+    const data = await checkedRow(sb.from('recurring_presence')
+      .insert({slot_id:slotId, instructor_id:myProfileId(), status:existing ? existing.status : 'presente', unpaid}).select());
+    return ()=>{
+      S.recurring = S.recurring.map(r=>closed && r.id===existing.id ? closed : r).concat(data);
+      toast(unpaidToast(unpaid));
+    };
+  });
+}
+function unpaidToast(unpaid){
+  return unpaid ? 'Non retribuita ogni settimana, da questa settimana.' : 'Di nuovo retribuita ogni settimana, da questa settimana.';
 }
 
 async function addExtraSlot({date, start_time, end_time, label}){
@@ -1874,11 +1924,12 @@ function computePayroll(data, pay, people, calendarFor){
         const seen = new Set(marks.map(a=>a.instructor_id).filter(Boolean));
         data.recurring.forEach(r=>{
           if(r.slot_id!==ref.slot_id || seen.has(r.instructor_id) || !byKey.has(r.instructor_id)) return;
-          if(recurringStatusOn(ref.slot_id, r.instructor_id, dateStr, data.recurring)!=='presente') return;
+          const cover = recurringOn(ref.slot_id, r.instructor_id, dateStr, data.recurring);
+          if(!cover || (cover.status||'presente')!=='presente') return;
           seen.add(r.instructor_id);
           const p = byKey.get(r.instructor_id);
           present.push(p);
-          if(p.forfaitMode) unpaid.add(p);
+          if(cover.unpaid || p.forfaitMode) unpaid.add(p);
         });
       }
       if(!present.length) return;
@@ -1946,11 +1997,11 @@ async function loadReport(){
       softRows(sb.from('pay_settings').select('*').eq('workspace_id', wsId)),
     ]);
     const slotIds = slots.map(x=>x.id), extraIds = extras.map(x=>x.id);
-    const dated = (table, column, ids)=> ids.length ? softRows(sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
+    const dated = (table, column, ids)=> ids.length ? softRows(()=> sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
     const [att, extraAtt, recurring, cancellations, forfaits] = await Promise.all([
       dated('attendance', 'slot_id', slotIds),
       dated('attendance', 'extra_slot_id', extraIds),
-      slotIds.length ? checkedRows(sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
+      slotIds.length ? allRows(()=> sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
       dated('lesson_cancellations', 'slot_id', slotIds),
       softRows(sb.from('pay_forfaits').select('*').eq('workspace_id', wsId)),
     ]);
@@ -2373,8 +2424,8 @@ const BACKUP_FORMAT = 'presencer-backup';
 
 async function softRows(query){
   // Alcune tabelle esistono solo se la migrazione e' stata eseguita: la loro
-  // assenza non deve far fallire l'intero backup.
-  try{ return await checkedRows(query); }
+  // assenza non deve far fallire l'intero backup. Una funzione = query paginata (allRows).
+  try{ return await (typeof query==='function' ? allRows(query) : checkedRows(query)); }
   catch(error){
     if(error && (error.code==='42P01' || error.code==='PGRST205')) return [];
     throw error;
@@ -2391,7 +2442,7 @@ async function buildBackup(){
   const slots = calIds.length ? await checkedRows(sb.from('slots').select('*').in('calendar_id', calIds)) : [];
   const extraSlots = calIds.length ? await checkedRows(sb.from('extra_slots').select('*').in('calendar_id', calIds)) : [];
   const slotIds = slots.map(s=>s.id), extraIds = extraSlots.map(s=>s.id);
-  const bySlot = (table, column, ids)=> ids.length ? softRows(sb.from(table).select('*').in(column, ids)) : [];
+  const bySlot = (table, column, ids)=> ids.length ? softRows(()=> sb.from(table).select('*').in(column, ids)) : [];
   const attendance = (await bySlot('attendance','slot_id',slotIds)).concat(await bySlot('attendance','extra_slot_id',extraIds));
   const recurring = await bySlot('recurring_presence','slot_id',slotIds);
   const lessonLogs = (await bySlot('lesson_logs','slot_id',slotIds)).concat(await bySlot('lesson_logs','extra_slot_id',extraIds));
@@ -2552,6 +2603,7 @@ async function restoreBackup(backup){
       if(!unique(['r', r.slot_id, who, r.ended_on||'attiva'].join('|'))){ skipped++; return; }
       const row = {id:r.id, slot_id:r.slot_id, instructor_id:who, status:r.status, created_at:r.created_at};
       if(r.ended_on) row.ended_on = r.ended_on;
+      if(r.unpaid) row.unpaid = true;
       recurring.push(row);
     });
     await insertAll('recurring_presence', recurring);
@@ -3196,8 +3248,7 @@ function renderDayList(dt){
     const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
     const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
     const absence = myAbsenceRequest(it.ref, dateStr);
-    const myRow = findMyAttendance(it.ref, dateStr);
-    const unpaidText = myRow && myRow.unpaid && myRow.status==='presente' ? ' · non retribuita' : '';
+    const unpaidText = myUnpaidOn(it.ref, dateStr) ? ' · non retribuita' : '';
     const absenceText = unpaidText + (!absence ? '' : absence.status==='in_attesa' ? ' · ⏳ assenza richiesta' : absence.status==='approvata' ? ' · assenza approvata' : ' · assenza rifiutata');
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
@@ -3949,8 +4000,10 @@ function renderModal(){
     const req = myAbsenceRequest(m.ref, m.date);
     const myState = myAttendanceState(m.ref, m.date);
     const canUnpaid = myState==='presente' || myState==='ricorrente';
-    const myMark = findMyAttendance(m.ref, m.date);
-    const unpaidOn = canUnpaid && !!(myMark && myMark.unpaid);
+    const unpaidOn = canUnpaid && myUnpaidOn(m.ref, m.date);
+    const myRec = !m.extra ? activeRecurring(m.slotId, myProfileId()) : null;
+    const recUnpaidOn = !!(myRec && myRec.unpaid);
+    const canRecUnpaid = !m.extra && (!myRec || (myRec.status||'presente')==='presente');
     const canAsk = !req || req.status==='rifiutata';
     const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
     box.innerHTML = `
@@ -3959,6 +4012,10 @@ function renderModal(){
       <h3>Compenso</h3>
       <label class="checkrow"><input type="checkbox" id="up_toggle" ${unpaidOn?'checked':''} ${canUnpaid && !presenceControlsDisabled()?'':'disabled'}>
         <span><b>Presenza non retribuita</b><small>${canUnpaid ? 'Risulti presente e le ore si contano, ma questa lezione non entra nei compensi.' : 'Segna prima la presenza a questa lezione.'}</small></span></label>
+      ${!m.extra ? `<label class="checkrow"><input type="checkbox" id="up_rec_toggle" ${recUnpaidOn?'checked':''} ${canRecUnpaid && !presenceControlsDisabled()?'':'disabled'}>
+        <span><b>Non retribuita ogni settimana 🔁</b><small>${!canRecUnpaid ? 'La tua ricorrenza su questo orario è "assente".'
+          : myRec ? 'Vale da questa settimana su tutte le prossime; le settimane passate restano come erano.'
+          : 'Attiva la presenza ricorrente su questo orario, non retribuita, da questa settimana.'}</small></span></label>` : ''}
       <h3 style="margin-top:18px">Richiesta di assenza</h3>
       ${canAsk ? `
         ${req ? '<p class="hint" style="margin:0 0 8px">La richiesta precedente è stata rifiutata.</p>' : ''}
@@ -3982,6 +4039,8 @@ function renderModal(){
         </div>
         <button class="btn danger block" id="cl_go">Annulla lezione</button>` : ''}`;
     box.querySelector('#up_toggle').onchange = e=> setAttendanceUnpaid(m.ref, m.date, e.target.checked);
+    const recToggle = box.querySelector('#up_rec_toggle');
+    if(recToggle) recToggle.onchange = e=> setRecurringUnpaid(m.slotId, e.target.checked);
     const send = box.querySelector('#ab_send');
     if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim());
     const withdraw = box.querySelector('#ab_withdraw');

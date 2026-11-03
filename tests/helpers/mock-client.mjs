@@ -14,6 +14,7 @@ export function mockClient(respond) {
         maybeSingle() { request.maybeSingle = true; return query; },
         order(column, options) { request.orders.push({ column, ...options }); return query; },
         limit(value) { request.limit = value; return query; },
+        range(from, to) { request.range = [from, to]; return query; },
         then(resolve, reject) { return Promise.resolve().then(() => respond(request)).then(resolve, reject); },
       };
       for (const operator of ['eq', 'in', 'gte', 'lte', 'gt']) {

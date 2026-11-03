@@ -52,6 +52,8 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   await db.exec(await sqlFile('migration_notifications.sql'));
   await db.exec(await sqlFile('migration_ore_compensi.sql'));
   await db.exec(await sqlFile('migration_ore_compensi.sql'));
+  await db.exec(await sqlFile('migration_recurring_unpaid.sql'));
+  await db.exec(await sqlFile('migration_recurring_unpaid.sql'));
 
   async function scenario(name, fn) {
     await t.test(name, async () => {
@@ -170,9 +172,12 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
     await db.exec(`
       insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}');
       update recurring_presence set ended_on = '2026-08-24';
-      insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}');
+      insert into recurring_presence (slot_id, instructor_id, unpaid) values ('${ids.slot}', '${ids.profile}', true);
     `);
     assert.equal((await db.query('select * from recurring_presence')).rows.length, 2);
+    assert.equal((await db.query('select count(*)::int n from recurring_presence where unpaid')).rows[0].n, 1);
+    const { rows: titles } = await db.query("select title from app_events where category = 'recurring' order by id");
+    assert.deepEqual(titles.map(e => e.title), ['Ricorrenza attivata', 'Ricorrenza disattivata', 'Ricorrenza attivata']);
     await fails(`insert into recurring_presence (slot_id, instructor_id) values ('${ids.slot}', '${ids.profile}')`, /duplicate key/);
   });
 

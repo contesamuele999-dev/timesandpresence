@@ -263,3 +263,48 @@ test('compensi: tariffa piena, compresenza a 2/3, maestro prende tutto, annullat
   assert.equal(r.b.entries.map(e => e.date).join(), '2026-08-31,2026-09-07,2026-09-28');
   assert.equal(r.b.amount, 90);
 });
+
+test('ricorrenza non retribuita: ore contate, compenso zero, la riga del giorno la scavalca', () => {
+  const { app } = appWith();
+  const people = [{ id: 'a', name: 'Anna', grade: 'istruttore' }, { id: 'b', name: 'Bruno', grade: 'istruttore' }];
+  const slots = [{ id: 's', calendar_id: 'cal', weekday: 0, start_time: '09:00', end_time: '10:00', label: 'Adulti' }];
+  // fino al 14/9 retribuita, poi non retribuita: lo storico resta pagato
+  const recurring = [
+    { slot_id: 's', instructor_id: 'b', status: 'presente', created_at: '2026-09-01T10:00:00Z', ended_on: '2026-09-14' },
+    { slot_id: 's', instructor_id: 'b', status: 'presente', unpaid: true, created_at: '2026-09-14T10:00:00Z', ended_on: null },
+  ];
+  const attendance = [
+    { slot_id: 's', instructor_id: 'a', date: '2026-09-14', status: 'presente' },
+    { slot_id: 's', instructor_id: 'b', date: '2026-09-21', status: 'presente', unpaid: false },
+  ];
+  const rows = Object.fromEntries(app.computePayroll({ from: '2026-09-07', to: '2026-09-27', slots, extras: [], cancellations: [], recurring, attendance },
+    { default_rate: 10, rates: {}, copresence_factor: 0.5, master_takes_all: true }, people, () => 'cal').map(r => [r.key, r]));
+  assert.equal(JSON.stringify(rows.b.entries.map(e => [e.date, e.amount, e.note])),
+    JSON.stringify([['2026-09-07', 10, ''], ['2026-09-14', 0, 'non retribuita'], ['2026-09-21', 10, '']]));
+  assert.equal(rows.b.hours, 3);
+  assert.equal(rows.a.amount, 10); // con b non retribuito, a non è in compresenza
+});
+
+test('non retribuita ogni settimana: chiude la ricorrenza vecchia e ne apre una nuova', async () => {
+  let n = 0;
+  const { app, S, calls, date } = appWith(request => ({ data: { id: 'r' + (++n), ...request.payload } }));
+  vm.runInContext('toast = ()=>{}', app);
+  S.recurring = [{ id: 'old', slot_id: 'slot', instructor_id: 'profile', status: 'presente', created_at: '2026-01-05T10:00:00Z', ended_on: null }];
+  await app.setRecurringUnpaid('slot', true);
+  assert.deepEqual(calls.map(c => c.operation), ['update', 'insert']);
+  assert.equal(calls[0].payload.ended_on, date);
+  assert.equal(calls[1].payload.unpaid, true);
+  assert.equal(app.myUnpaidOn(ref, date), true);
+  // nata questa settimana: si aggiorna e basta
+  await app.setRecurringUnpaid('slot', false);
+  assert.equal(calls[2].operation, 'update');
+  assert.equal(calls.length, 3);
+  assert.equal(app.myUnpaidOn(ref, date), false);
+});
+
+test('le letture lunghe vanno a pagine da 1000 righe', async () => {
+  const { app, calls } = appWith(request => ({ data: Array.from({ length: request.range[0] < 2000 ? 1000 : 3 }, (_, i) => ({ id: request.range[0] + i })) }));
+  const rows = await app.allRows(() => app.mock.from('attendance').select('*'));
+  assert.equal(rows.length, 2003);
+  assert.deepEqual(calls.map(c => c.range[0]), [0, 1000, 2000]);
+});

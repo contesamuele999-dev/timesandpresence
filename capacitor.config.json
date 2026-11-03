@@ -3,6 +3,9 @@
   "appName": "Presencer",
   "webDir": "www",
   "backgroundColor": "#F6F5F3",
+  "server": {
+    "url": "https://contesamuele999-dev.github.io/timesandpresence/"
+  },
   "plugins": {
     "LocalNotifications": {
       "smallIcon": "ic_stat_presencer",

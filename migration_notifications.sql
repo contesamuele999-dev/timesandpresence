@@ -121,9 +121,12 @@ begin
         from slots s join calendars c on c.id = s.calendar_id
         where s.id = row_data.slot_id;
       select name into target_name from profiles where id = row_data.instructor_id;
-      event_title := case tg_op when 'DELETE' then 'Ricorrenza disattivata' else 'Ricorrenza attivata' end;
-      event_body := coalesce(target_name, 'Un membro') || case tg_op
-        when 'DELETE' then ' ha disattivato una presenza ricorrente.'
+      -- chiudere una ricorrenza è un UPDATE di ended_on, non un DELETE (letto via jsonb:
+      -- la colonna arriva con migration_ore_compensi.sql, che può non essere ancora eseguita)
+      event_title := case when tg_op = 'DELETE' or to_jsonb(row_data)->>'ended_on' is not null
+        then 'Ricorrenza disattivata' else 'Ricorrenza attivata' end;
+      event_body := coalesce(target_name, 'Un membro') || case
+        when tg_op = 'DELETE' or to_jsonb(row_data)->>'ended_on' is not null then ' ha disattivato una presenza ricorrente.'
         else ' risulta ' || lower(row_data.status) || ' ogni settimana.' end;
 
     when 'lesson_logs' then

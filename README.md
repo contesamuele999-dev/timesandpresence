@@ -82,6 +82,14 @@ nella radice come `Presencer-debug.apk`. Per aggiornare il progetto Android senz
 npm run android:sync
 ```
 
+### Aggiornamento automatico dell'APK
+
+L'APK non contiene una copia fissa dell'app: apre il sito pubblicato su GitHub Pages
+(`server.url` in [`capacitor.config.json`](capacitor.config.json)). Ogni `push-to-github.bat`
+arriva quindi sul telefono al successivo avvio, senza reinstallare. Il service worker tiene una copia
+per aprire l'app anche senza rete. Va reinstallato solo quando cambia la parte nativa (plugin
+Capacitor, `PrintPlugin`, icone, permessi) o `capacitor.config.json`.
+
 Il progetto nativo usa l'ID `it.presencer.app`, include l'icona Presencer e supporta Android 7 (API 24) o successivo.
 
 ## 5. Deploy su GitHub Pages
@@ -143,6 +151,8 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
    a partire dalla data programmata.
 6. [`migration_notifications.sql`](migration_notifications.sql) — eventi in tempo reale, preferenze per utente
    e categorie di notifica separate.
+7. [`migration_ore_compensi.sql`](migration_ore_compensi.sql) — ore, compensi, assenze, lezioni annullate.
+8. [`migration_recurring_unpaid.sql`](migration_recurring_unpaid.sql) — presenza ricorrente non retribuita.
 
 ## Come funziona
 

@@ -355,7 +355,9 @@
 <script src="native.js"></script>
 <script src="app.js"></script>
 <script>
-  if ('serviceWorker' in navigator && !(window.PresencerNative && window.PresencerNative.isNative)) {
+  // Nell'APK l'app si carica dal sito pubblicato (capacitor.config.json → server.url):
+  // il service worker tiene la copia per l'avvio senza rete. Solo il pacchetto locale ne fa a meno.
+  if ('serviceWorker' in navigator && !(window.PresencerNative && window.PresencerNative.isNative && location.hostname === 'localhost')) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('./sw.js').catch(() => {});
     });
