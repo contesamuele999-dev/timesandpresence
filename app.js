@@ -512,8 +512,23 @@ async function startNotificationListener(){
     .subscribe();
 }
 
+/* ---------------- nuova versione ----------------
+   L'app arriva dal sito a ogni avvio; se resta aperta a lungo, al ritorno in primo
+   piano confronta l'impronta di app.js con quella di partenza e propone di ricaricare. */
+let appVersionTag = null;
+async function checkForUpdate(){
+  try{
+    const res = await fetch('app.js', {method:'HEAD', cache:'no-store'});
+    const tag = res.ok ? (res.headers.get('etag') || res.headers.get('last-modified')) : null;
+    if(!tag) return;
+    if(!appVersionTag){ appVersionTag = tag; return; }
+    if(tag!==appVersionTag && !S.updateReady){ S.updateReady = true; render(); }
+  }catch(e){ /* senza rete si riprova al prossimo ritorno */ }
+}
+
 document.addEventListener('visibilitychange', ()=>{
   if(document.visibilityState!=='visible') return;
+  checkForUpdate();
   if(S.view==='app' && !isGuest()){
     // Mentre l'app era in secondo piano Android sospende la WebView e il rinnovo
     // automatico del token si ferma: al ritorno lo rinnoviamo noi, altrimenti la
@@ -739,6 +754,7 @@ function getEffectiveCalendarForWeek(monday){
 
 /* ---------------- boot ---------------- */
 async function boot(){
+  checkForUpdate();
   if(!window.SUPABASE_URL || window.SUPABASE_URL.indexOf('INCOLLA_QUI') === 0){
     S.view='setup'; render(); return;
   }
@@ -1953,6 +1969,15 @@ function computePayroll(data, pay, people, calendarFor){
       });
     });
   });
+  // rettifiche (bonus, rimborsi, trattenute): fuori dalle ore, dentro il totale
+  (data.adjustments||[]).forEach(a=>{
+    if(a.date<data.from || a.date>data.to || !byKey.has(a.profile_id)) return;
+    const p = byKey.get(a.profile_id), amount = round2(Number(a.amount)||0);
+    p.adjust = round2((p.adjust||0) + amount);
+    p.amount = round2(p.amount + amount);
+    p.entries.push({date:a.date, label:'Rettifica', start:'', end:'', hours:0, rate:0, amount, note:a.note||'', adjustmentId:a.id});
+  });
+  byKey.forEach(p=> p.entries.sort((x,y)=> x.date.localeCompare(y.date)));
   // il forfait si aggiunge una volta per periodo, non per lezione
   const monthly = new Map((data.forfaits||[]).map(f=>[f.profile_id, Number(f.monthly_amount)||0]));
   byKey.forEach(p=>{
@@ -1998,16 +2023,17 @@ async function loadReport(){
     ]);
     const slotIds = slots.map(x=>x.id), extraIds = extras.map(x=>x.id);
     const dated = (table, column, ids)=> ids.length ? softRows(()=> sb.from(table).select('*').in(column, ids).gte('date', from).lte('date', to)) : [];
-    const [att, extraAtt, recurring, cancellations, forfaits] = await Promise.all([
+    const [att, extraAtt, recurring, cancellations, forfaits, adjustments] = await Promise.all([
       dated('attendance', 'slot_id', slotIds),
       dated('attendance', 'extra_slot_id', extraIds),
       slotIds.length ? allRows(()=> sb.from('recurring_presence').select('*').in('slot_id', slotIds)) : [],
       dated('lesson_cancellations', 'slot_id', slotIds),
       softRows(sb.from('pay_forfaits').select('*').eq('workspace_id', wsId)),
+      softRows(()=> sb.from('pay_adjustments').select('*').eq('workspace_id', wsId).gte('date', from).lte('date', to)),
     ]);
     if(S.workspace?.id!==wsId || key!==[wsId, ...Object.values(reportRange())].join('|')) return;
     S.paySettings = Object.assign({}, DEFAULT_PAY, settings[0]||{});
-    S.reportData = {from, to, slots, extras, attendance:att.concat(extraAtt), recurring, cancellations, forfaits};
+    S.reportData = {from, to, slots, extras, attendance:att.concat(extraAtt), recurring, cancellations, forfaits, adjustments};
   }catch(error){
     if(S.workspace?.id===wsId) showDataError(error, 'Caricamento ore');
   }finally{
@@ -2035,6 +2061,25 @@ async function savePaySettings(values, people=[]){
   }catch(error){ closeModal(); showDataError(error, 'Salvataggio regole compensi'); }
 }
 
+async function addPayAdjustment(profileId, date, amount, note){
+  if(!isAdmin()) return;
+  if(!date || !Number.isFinite(amount) || !amount || !note) return toast('Indica data, importo e motivo.');
+  try{
+    await checkedRow(sb.from('pay_adjustments').insert({workspace_id:S.workspace.id, profile_id:profileId,
+      date, amount:round2(amount), note, created_by:myProfileId()}).select('id'));
+    closeModal(); toast('Rettifica aggiunta.');
+    await loadReport();
+  }catch(error){ closeModal(); showDataError(error, 'Rettifica compenso'); }
+}
+async function deletePayAdjustment(id){
+  if(!isAdmin() || !confirm('Eliminare questa rettifica?')) return;
+  try{
+    await checkedRow(sb.from('pay_adjustments').delete().eq('id', id).select('id'));
+    toast('Rettifica eliminata.');
+    await loadReport();
+  }catch(error){ showDataError(error, 'Eliminazione rettifica'); }
+}
+
 // Stampa (o PDF nell'APK) di quello che la scheda Ore mostra in questo momento.
 async function printReport(title){
   const native = nativeNotifications();
@@ -2053,6 +2098,19 @@ function reportCsv(rows, from, to){
   rows.forEach(p=>{ if(p.forfait) lines.push([p.name, from+' / '+to, 'Forfait '+num(p.forfaitMonthly)+' €/mese', '', '', '', '', num(p.forfait), ''].map(cell).join(';')); });
   rows.forEach(p=> lines.push([p.name+' TOTALE', from+' / '+to, '', '', '', num(p.hours), '', num(p.amount), p.lessons+' lezioni'].map(cell).join(';')));
   // BOM: senza, Excel apre gli accenti come caratteri strani
+  return '\ufeff' + lines.join('\r\n');
+}
+
+// Una riga per persona, colonne fisse: è il foglio da passare a chi fa le paghe.
+function payrollCsv(rows, from, to){
+  const cell = v=> `"${String(v).replace(/"/g,'""')}"`;
+  const num = n=> String(round2(n)).replace('.', ',');
+  const lines = [['Persona','Dal','Al','Modo','Lezioni','Ore','Ore retribuite','Compenso lezioni €','Forfait €','Rettifiche €','Totale €'].map(cell).join(';')];
+  rows.forEach(p=>{
+    const forfait = p.forfait||0, adjust = p.adjust||0;
+    lines.push([p.name, from, to, p.forfaitMode ? 'forfait' : 'ore', p.lessons, num(p.hours), num(p.paidHours),
+      num(p.amount - forfait - adjust), num(forfait), num(adjust), num(p.amount)].map(cell).join(';'));
+  });
   return '\ufeff' + lines.join('\r\n');
 }
 
@@ -2110,11 +2168,12 @@ function absenceLesson(r){
   return `${l.label || 'Lezione'}${l.start_time ? ' '+fmtHM(l.start_time) : ''}`;
 }
 
-async function requestAbsence(ref, dateStr, reason){
+async function requestAbsence(ref, dateStr, reason, substituteId){
   if(isGuest()) return;
+  const sub = substituteId ? {substitute_id:substituteId, substitute_status:'proposta'} : {};
   const ok = await runPresenceWrite('Richiesta di assenza', async ()=>{
     const row = await checkedRow(sb.from('absence_requests').insert(Object.assign(
-      {workspace_id:S.workspace.id, instructor_id:myProfileId(), date:dateStr, reason:reason||null}, ref))
+      {workspace_id:S.workspace.id, instructor_id:myProfileId(), date:dateStr, reason:reason||null}, sub, ref))
       .select('*, slots(label,start_time,end_time), extra_slots(label,start_time,end_time)'));
     return ()=>{ S.absenceRequests.push(row); toast('Richiesta inviata: tutti riceveranno un avviso.'); };
   });
@@ -2131,6 +2190,21 @@ async function decideAbsence(id, status){
   });
   // approvata: il database ha segnato l'assenza, la rileggiamo
   if(ok && status==='approvata') await refreshWeekData();
+}
+
+// Il collega proposto come sostituto risponde; se accetta, il database lo segna presente.
+async function answerSubstitute(id, accept){
+  const ok = await runPresenceWrite(accept ? 'Accetta sostituzione' : 'Rifiuta sostituzione', async ()=>{
+    const row = await checkedRow(sb.from('absence_requests').update({substitute_status: accept ? 'accettata' : 'rifiutata'})
+      .eq('id', id).select('*, slots(label,start_time,end_time), extra_slots(label,start_time,end_time)'));
+    return ()=>{ S.absenceRequests = S.absenceRequests.map(r=>r.id===id ? row : r); toast(accept ? 'Sostituzione accettata: risulti presente.' : 'Sostituzione rifiutata.'); };
+  });
+  if(ok && accept) await refreshWeekData();
+}
+function substituteText(r){
+  if(!r.substitute_id) return '';
+  const st = r.substitute_status==='accettata' ? 'ha accettato' : r.substitute_status==='rifiutata' ? 'ha rifiutato' : 'da confermare';
+  return ` · sostituto: ${instructorName(r.substitute_id)} (${st})`;
 }
 
 async function withdrawAbsence(id){
@@ -2703,7 +2777,42 @@ function restoreUi(ui){
   if(!document.body.classList.contains('modal-open') && (window.scrollY||0) !== ui.pageY) window.scrollTo(0, ui.pageY);
 }
 
+/* ---------------- promemoria presenza (solo APK) ----------------
+   Mezz'ora dopo l'ultima lezione di oggi ancora da segnare arriva un avviso.
+   Si ricalcola a ogni disegno, ma il telefono viene toccato solo se cambia qualcosa. */
+const REMINDER_OFF_KEY = 'presenceReminderOff';
+let reminderKey = null;
+function reminderEnabled(){ try{ return !localStorage.getItem(REMINDER_OFF_KEY); }catch(e){ return true; } }
+function pendingReminder(){
+  if(S.view!=='app' || isGuest() || S.weekOffset!==0 || S.weekDataContext!==presenceContext()) return undefined; // dati di oggi non a schermo
+  if(!reminderEnabled() || S.notificationPermission!=='granted') return null;
+  const today = todayISO();
+  const open = slotsForDate(new Date()).filter(it=> !it.cancelled && myAttendanceState(it.ref, today)===null
+    && !(myAbsenceRequest(it.ref, today)||{}).status);
+  if(!open.length) return null;
+  const last = open.reduce((a,b)=> a.end > b.end ? a : b);
+  const [h,mi] = fmtHM(last.end).split(':').map(Number);
+  const at = new Date(); at.setHours(h, mi+30, 0, 0);
+  if(at <= new Date()) return null;
+  return {at, body: open.length===1 ? `Non hai ancora segnato ${last.label} delle ${fmtHM(last.start)}.` : `Hai ${open.length} lezioni di oggi da segnare.`};
+}
+function syncPresenceReminder(){
+  const native = nativeNotifications();
+  if(!native || !native.scheduleReminder) return;
+  const next = pendingReminder();
+  if(next===undefined) return;
+  const key = next ? next.at.getTime()+'|'+next.body : '';
+  if(key===reminderKey) return;
+  reminderKey = key;
+  (next ? native.scheduleReminder(next) : native.cancelReminder()).catch(e=> console.warn('Promemoria non aggiornato', e));
+}
+function setReminderEnabled(on){
+  try{ on ? localStorage.removeItem(REMINDER_OFF_KEY) : localStorage.setItem(REMINDER_OFF_KEY, '1'); }catch(e){}
+  render();
+}
+
 function renderNow(){
+  syncPresenceReminder();
   const ui = captureUi();
   const next = document.createDocumentFragment();
   if(S.view==='loading'){ const sp = document.createElement('div'); sp.className = 'spinner'; next.appendChild(sp); }
@@ -3002,6 +3111,7 @@ function renderShell(){
   const main = document.createElement('main');
   if(allView) main.className = 'wide';
   if(S.dataError) main.appendChild(renderDataError());
+  if(S.tab==='presenze' && monthlySummaryDue()) main.appendChild(renderMonthlySummary());
   if(S.tab==='presenze') main.appendChild(renderPresenze());
   if(S.tab==='ore') main.appendChild(renderOre());
   if(S.tab==='calendari') main.appendChild(renderCalendari());
@@ -3028,11 +3138,47 @@ function renderShell(){
   wrap.appendChild(nav);
 
   const im = installMode();
-  if(im) wrap.appendChild(renderInstallBar(im, true));
+  if(S.updateReady){
+    const bar = document.createElement('div');
+    bar.className = 'installbar above-tab';
+    bar.innerHTML = `<span style="font-size:22px">✨</span>
+      <div class="txt">Nuova versione disponibile<small>Tocca Aggiorna per usarla subito</small></div>
+      <button class="go">Aggiorna</button>`;
+    bar.querySelector('.go').onclick = ()=> location.reload();
+    wrap.appendChild(bar);
+  }
+  else if(im) wrap.appendChild(renderInstallBar(im, true));
 
   if(S.modal) wrap.appendChild(renderModal());
 
   return wrap;
+}
+
+/* -------- riepilogo del mese appena chiuso --------
+   Nella prima settimana del mese ricorda che le ore del mese prima sono complete. */
+function lastMonthStart(){ const n = new Date(); return toISO(new Date(n.getFullYear(), n.getMonth()-1, 1)); }
+function monthlySummaryKey(){ return `summarySeen_${S.workspace?.id}_${lastMonthStart().slice(0,7)}`; }
+function monthlySummaryDue(){
+  if(isGuest() || !S.workspace || new Date().getDate()>7) return false;
+  try{ return !localStorage.getItem(monthlySummaryKey()); }catch(e){ return false; }
+}
+function renderMonthlySummary(){
+  const from = lastMonthStart();
+  const month = new Date(+from.slice(0,4), +from.slice(5,7)-1, 1).toLocaleDateString('it-IT', {month:'long'});
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `<div class="row between"><div><b>📊 Riepilogo di ${esc(month)} pronto</b>
+      <div class="hint">${isAdmin() ? 'Ore e compensi di tutti, con il foglio paghe da scaricare.' : 'Le tue ore e i tuoi compensi del mese.'}</div></div>
+    <button class="btn ghost sm" data-x aria-label="Nascondi">✕</button></div>
+    <button class="btn block" data-go style="margin-top:10px">Apri riepilogo</button>`;
+  const seen = ()=>{ try{ localStorage.setItem(monthlySummaryKey(), '1'); }catch(e){} };
+  card.querySelector('[data-x]').onclick = ()=>{ seen(); render(); };
+  card.querySelector('[data-go]').onclick = ()=>{
+    seen();
+    Object.assign(S, {tab:'ore', reportMode:'month', reportFrom:from, reportPerson:''});
+    loadReport(); render();
+  };
+  return card;
 }
 
 /* -------- Presenze tab -------- */
@@ -3112,7 +3258,8 @@ function renderPresenze(){
     render();
   });
 
-  const pending = S.absenceRequests.filter(r=> r.status==='in_attesa' && r.date>=todayISO());
+  const askedMe = r=> r.substitute_id===myProfileId() && r.substitute_status==='proposta' && r.status!=='rifiutata';
+  const pending = S.absenceRequests.filter(r=> r.date>=todayISO() && (r.status==='in_attesa' || askedMe(r)));
   if(pending.length){
     const card = document.createElement('div');
     card.className = 'card absence-card';
@@ -3123,11 +3270,14 @@ function renderPresenze(){
       const row = document.createElement('div');
       row.className = 'listrow';
       row.innerHTML = `<div class="main"><div class="t">${esc(instructorName(r.instructor_id))} · ${esc(absenceLesson(r))}</div>
-          <div class="s">${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}${r.reason ? ' · '+esc(r.reason) : ''}</div></div>
-        ${isAdmin() ? `<button class="btn sm" data-ok ${presenceControlsDisabled()?'disabled':''}>Approva</button><button class="btn ghost sm" data-no ${presenceControlsDisabled()?'disabled':''}>Rifiuta</button>`
+          <div class="s">${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}${r.reason ? ' · '+esc(r.reason) : ''}${esc(substituteText(r))}</div></div>
+        ${askedMe(r) ? `<button class="btn sm" data-sub-ok ${presenceControlsDisabled()?'disabled':''}>Sostituisco</button><button class="btn ghost sm" data-sub-no ${presenceControlsDisabled()?'disabled':''}>Non posso</button>` : ''}
+        ${r.status!=='in_attesa' ? '' : isAdmin() ? `<button class="btn sm" data-ok ${presenceControlsDisabled()?'disabled':''}>Approva</button><button class="btn ghost sm" data-no ${presenceControlsDisabled()?'disabled':''}>Rifiuta</button>`
           : mine ? `<button class="btn ghost sm" data-wd ${presenceControlsDisabled()?'disabled':''}>Ritira</button>` : '<span class="pill">In attesa</span>'}`;
       const ok = row.querySelector('[data-ok]'); if(ok) ok.onclick = ()=> decideAbsence(r.id, 'approvata');
       const no = row.querySelector('[data-no]'); if(no) no.onclick = ()=> decideAbsence(r.id, 'rifiutata');
+      const subOk = row.querySelector('[data-sub-ok]'); if(subOk) subOk.onclick = ()=> answerSubstitute(r.id, true);
+      const subNo = row.querySelector('[data-sub-no]'); if(subNo) subNo.onclick = ()=> answerSubstitute(r.id, false);
       const wd = row.querySelector('[data-wd]'); if(wd) wd.onclick = ()=>{ if(confirm('Ritirare la richiesta di assenza?')) withdrawAbsence(r.id); };
       card.appendChild(row);
     });
@@ -3313,12 +3463,15 @@ function renderDayMatrix(dt){
         return sameSlot && a.date===dateStr && c.match(a);
       });
       let state = row ? row.status : null;
+      let unpaid = !!(row && row.status==='presente' && row.unpaid);
       if(!state && !c.guestCol && !it.extra){
-        const rs = recurringStatusOn(it.id, c.instructorId, dateStr);
+        const r = recurringOn(it.id, c.instructorId, dateStr);
+        const rs = r ? (r.status || 'presente') : null;
         if(rs) state = rs==='assente' ? 'ricorrente-assente' : 'ricorrente';
+        unpaid = !!(r && rs==='presente' && r.unpaid);
       }
-      const cls = state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : state==='assente' ? 'off' : '';
-      html += `<td><span class="mchip ${cls}"></span></td>`;
+      const cls = (state==='presente' ? 'on' : state==='ricorrente' ? 'on rec' : state==='ricorrente-assente' ? 'off rec' : state==='assente' ? 'off' : '') + (unpaid ? ' unpaid' : '');
+      html += `<td><span class="mchip ${cls}"${unpaid ? ' title="Non retribuita"' : ''}></span></td>`;
     });
     html += `</tr>`;
   });
@@ -3426,7 +3579,8 @@ function renderOre(){
     <div class="row noprint" style="margin-top:12px">
       <label class="checkrow" style="margin:0"><input type="checkbox" id="repDetail" ${S.reportDetail?'checked':''}><span>Dettaglio lezioni</span></label>
       <span class="grow"></span>
-      <button class="btn secondary sm" id="repCsv">⬇ CSV</button>
+      <button class="btn secondary sm" id="repCsv" title="Tutte le lezioni, una riga ciascuna">⬇ CSV</button>
+      ${isAdmin() ? '<button class="btn secondary sm" id="repPayCsv" title="Una riga per persona: ore, compensi, forfait, rettifiche">⬇ Paghe</button>' : ''}
       <button class="btn sm" id="repPrint">🖨 Stampa</button>
     </div>
     ${S.paySettings && !S.paySettings.default_rate && !Object.keys(S.paySettings.rates||{}).length ? `<p class="hint noprint">Nessuna tariffa impostata: i compensi risultano 0. ${isAdmin()?'Impostale da “Regole e tariffe”.':'Chiedi all’amministratore di impostarle.'}</p>` : ''}`;
@@ -3445,16 +3599,24 @@ function renderOre(){
     const name = `ore-${from}-${upTo}.csv`;
     if(!downloadText(name, reportCsv(rows, from, upTo), 'text/csv;charset=utf-8')) toast('Download non riuscito.');
   };
+  const payCsv = summary.querySelector('#repPayCsv');
+  if(payCsv) payCsv.onclick = ()=>{
+    if(!downloadText(`paghe-${from}-${upTo}.csv`, payrollCsv(rows.filter(p=>!p.key.startsWith('g:')), from, upTo), 'text/csv;charset=utf-8')) toast('Download non riuscito.');
+  };
   host.appendChild(summary);
 
-  if(S.reportDetail) rows.filter(p=>p.entries.length || p.forfait).forEach(p=>{
+  const canAdjust = p=> isAdmin() && !p.key.startsWith('g:');
+  if(S.reportDetail) rows.filter(p=>p.entries.length || p.forfait || canAdjust(p)).forEach(p=>{
     const card = document.createElement('div');
     card.className = 'card report-detail';
-    card.innerHTML = `<h3>${esc(p.name)}</h3>
+    card.innerHTML = `<div class="row between"><h3 style="margin:0">${esc(p.name)}</h3>${canAdjust(p) ? '<button class="btn ghost sm noprint" data-adj title="Bonus, rimborso o trattenuta">+ Rettifica</button>' : ''}</div>
       <table class="report"><thead><tr><th>Data</th><th>Lezione</th><th>Ore</th><th>Compenso</th></tr></thead><tbody>
-      ${p.entries.map(e=>{ const [y,m,dd] = e.date.split('-').map(Number); return `<tr><td>${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}</td><td>${esc(e.label)} <span class="hint">${fmtHM(e.start)}–${fmtHM(e.end)}${e.note?' · '+esc(e.note):''}</span></td><td>${fmtHours(e.hours)}</td><td>${euro(e.amount)}</td></tr>`; }).join('')}
+      ${p.entries.map(e=>{ const [y,m,dd] = e.date.split('-').map(Number); return `<tr><td>${WEEKDAYS[(new Date(y,m-1,dd).getDay()+6)%7]} ${dd} ${MONTHS[m-1]}</td><td>${esc(e.label)} <span class="hint">${e.adjustmentId ? '' : fmtHM(e.start)+'–'+fmtHM(e.end)}${e.note ? (e.adjustmentId ? '' : ' · ')+esc(e.note) : ''}</span>${e.adjustmentId && isAdmin() ? ` <button class="btn ghost sm noprint" data-adj-del="${esc(e.adjustmentId)}" aria-label="Elimina rettifica">✕</button>` : ''}</td><td>${e.adjustmentId ? '' : fmtHours(e.hours)}</td><td>${euro(e.amount)}</td></tr>`; }).join('')}
       ${p.forfait ? `<tr><td colspan="3">Forfait ${euro(p.forfaitMonthly)}/mese · quota del periodo</td><td>${euro(p.forfait)}</td></tr>` : ''}
       </tbody><tfoot><tr><td colspan="2">Totale</td><td>${fmtHours(p.hours)}</td><td>${euro(p.amount)}</td></tr></tfoot></table>`;
+    const adj = card.querySelector('[data-adj]');
+    if(adj) adj.onclick = ()=> openModal({type:'pay-adjustment', profileId:p.key, name:p.name, date:upTo, min:from, max:upTo});
+    card.querySelectorAll('[data-adj-del]').forEach(b=> b.onclick = ()=> deletePayAdjustment(b.dataset.adjDel));
     host.appendChild(card);
   });
   return d;
@@ -3690,6 +3852,10 @@ function renderProfilo(){
             <span><b>${esc(t.label)}</b><small>${esc(t.description)}</small></span>
           </label>`).join('')}
       </div>
+      ${nativeNotifications() ? `<label class="checkrow">
+        <input type="checkbox" id="p_reminder" ${reminderEnabled()?'checked':''}>
+        <span><b>Promemoria presenza</b><small>Mezz’ora dopo l’ultima lezione di oggi, se non l’hai ancora segnata.</small></span>
+      </label>` : ''}
       ${S.notificationPermission!=='granted' ? '<button class="btn secondary block" id="p_notif_permission">Consenti notifiche</button>' : ''}
       ${S.notificationSetupMissing ? '<p class="hint notification-warning">⚠️ Esegui <b>migration_notifications.sql</b> su Supabase per ricevere le modifiche degli altri utenti.</p>' : ''}
     </div>
@@ -3711,6 +3877,8 @@ function renderProfilo(){
   d.querySelectorAll('[data-notification-pref]').forEach(input=>{
     input.onchange = ()=> setNotificationPreference(input.dataset.notificationPref, input.checked);
   });
+  const reminder = d.querySelector('#p_reminder');
+  if(reminder) reminder.onchange = ()=> setReminderEnabled(reminder.checked);
   const notifPermission = d.querySelector('#p_notif_permission');
   if(notifPermission) notifPermission.onclick = enableDeviceNotifications;
   d.querySelector('#p_avatar_go').onclick = ()=> d.querySelector('#p_avatar_file').click();
@@ -4006,6 +4174,7 @@ function renderModal(){
     const canRecUnpaid = !m.extra && (!myRec || (myRec.status||'presente')==='presente');
     const canAsk = !req || req.status==='rifiutata';
     const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
+    const colleagues = S.instructors.filter(p=> p.id!==myProfileId());
     box.innerHTML = `
       <div class="mhead"><h2>${esc(m.label)}</h2><button id="x">✕</button></div>
       <p class="hint" style="margin:0 0 14px">${esc(fmtHM(m.start))}–${esc(fmtHM(m.end))} · ${dateLabel}</p>
@@ -4020,9 +4189,10 @@ function renderModal(){
       ${canAsk ? `
         ${req ? '<p class="hint" style="margin:0 0 8px">La richiesta precedente è stata rifiutata.</p>' : ''}
         <label class="field"><span>Motivo (facoltativo)</span><input type="text" id="ab_reason" placeholder="Es. visita medica"></label>
+        ${colleagues.length ? `<label class="field"><span>Chi ti sostituisce (facoltativo)</span><select id="ab_sub"><option value="">Nessuno</option>${colleagues.map(p=>`<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}</select></label>` : ''}
         <button class="btn block" id="ab_send">Chiedi di assentarti</button>
         <p class="hint">Tutti i membri ricevono un avviso; un amministratore conferma o rifiuta.</p>`
-      : `<p class="hint" style="margin:0 0 8px">${req.status==='in_attesa' ? '⏳ Richiesta inviata, in attesa di conferma.' : '✅ Assenza approvata.'}</p>
+      : `<p class="hint" style="margin:0 0 8px">${req.status==='in_attesa' ? '⏳ Richiesta inviata, in attesa di conferma.' : '✅ Assenza approvata.'}${esc(substituteText(req))}</p>
         ${req.status==='in_attesa' ? '<button class="btn secondary block" id="ab_withdraw">Ritira richiesta</button>' : ''}`}
       ${isAdmin() && !m.extra ? `
         <h3 style="margin-top:22px">Annulla questa lezione</h3>
@@ -4042,7 +4212,7 @@ function renderModal(){
     const recToggle = box.querySelector('#up_rec_toggle');
     if(recToggle) recToggle.onchange = e=> setRecurringUnpaid(m.slotId, e.target.checked);
     const send = box.querySelector('#ab_send');
-    if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim());
+    if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim(), box.querySelector('#ab_sub')?.value || null);
     const withdraw = box.querySelector('#ab_withdraw');
     if(withdraw) withdraw.onclick = ()=> withdrawAbsence(req.id);
     const repl = box.querySelector('#cl_repl');
@@ -4055,6 +4225,18 @@ function renderModal(){
       } : null;
       if(confirm(replacement ? 'Annullare la lezione e creare quella sostitutiva?' : 'Annullare la lezione di questa data?')) cancelLesson(m.slotId, m.date, box.querySelector('#cl_reason').value.trim(), replacement);
     };
+  }
+
+  else if(m.type==='pay-adjustment'){
+    box.innerHTML = `
+      <div class="mhead"><h2>Rettifica · ${esc(m.name)}</h2><button id="x">✕</button></div>
+      <label class="field"><span>Data</span><input type="date" id="pa_date" value="${m.date}" min="${m.min}" max="${m.max}"></label>
+      <label class="field"><span>Importo € (negativo per una trattenuta)</span><input type="text" id="pa_amount" placeholder="Es. 50 oppure -20"></label>
+      <label class="field"><span>Motivo</span><input type="text" id="pa_note" placeholder="Es. rimborso benzina"></label>
+      <button class="btn block" id="pa_go">Aggiungi</button>
+      <p class="hint">Entra nel totale del periodo, non nelle ore. La vede solo la persona interessata e gli amministratori.</p>`;
+    box.querySelector('#pa_go').onclick = ()=> addPayAdjustment(m.profileId, box.querySelector('#pa_date').value,
+      Number(box.querySelector('#pa_amount').value.replace(',', '.')), box.querySelector('#pa_note').value.trim());
   }
 
   else if(m.type==='pay-settings'){

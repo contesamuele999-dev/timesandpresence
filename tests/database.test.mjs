@@ -54,6 +54,8 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   await db.exec(await sqlFile('migration_ore_compensi.sql'));
   await db.exec(await sqlFile('migration_recurring_unpaid.sql'));
   await db.exec(await sqlFile('migration_recurring_unpaid.sql'));
+  await db.exec(await sqlFile('migration_sostituzioni_rettifiche.sql'));
+  await db.exec(await sqlFile('migration_sostituzioni_rettifiche.sql'));
 
   async function scenario(name, fn) {
     await t.test(name, async () => {
@@ -156,6 +158,39 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
     const { rows } = await db.query("select category, title from app_events order by id");
     assert.deepEqual(rows.map(e => e.title), ['Richiesta di assenza', 'Assenza approvata']);
     assert.ok(rows.every(e => e.category === 'absence'));
+  });
+
+  await scenario('sostituzione: solo il collega proposto risponde e, se accetta, risulta presente', async () => {
+    await asUser();
+    await fails(`insert into absence_requests (workspace_id, slot_id, instructor_id, date, substitute_id)
+      values ('${ids.ws}', '${ids.slot}', '${ids.profile}', '2026-08-24', '${ids.profile}')`, /altro membro/);
+    const { rows: [request] } = await db.query(`
+      insert into absence_requests (workspace_id, slot_id, instructor_id, date, substitute_id)
+      values ($1, $2, $3, '2026-08-24', $4) returning *`, [ids.ws, ids.slot, ids.profile, ids.admin]);
+    assert.equal(request.substitute_status, 'proposta');
+    // il sostituto (account "other", profilo admin) risponde come sostituto, non come admin:
+    // lo togliamo dal ruolo admin per provare il controllo
+    await db.exec(`reset role; set local request.jwt.claim.sub = ''; update profiles set role = 'instructor' where id = '${ids.admin}'`);
+    await asUser(ids.other);
+    await fails(`update absence_requests set status = 'approvata' where id = '${request.id}'`, /accettare o rifiutare/);
+    await db.query(`update absence_requests set substitute_status = 'accettata' where id = $1`, [request.id]);
+    const { rows: [presence] } = await db.query('select status from attendance where instructor_id = $1', [ids.admin]);
+    assert.equal(presence.status, 'presente');
+    const { rows } = await db.query("select title, body from app_events where category = 'absence' order by id");
+    assert.deepEqual(rows.map(e => e.title), ['Richiesta di assenza', 'Sostituzione accettata']);
+    assert.match(rows[0].body, /sostituto: /);
+  });
+
+  await scenario('rettifiche: le scrive un admin, le vede solo l’interessato', async () => {
+    await asUser();
+    await fails(`insert into pay_adjustments (workspace_id, profile_id, date, amount, note)
+      values ('${ids.ws}', '${ids.profile}', '2026-08-24', 50, 'Bonus')`, /row-level security/);
+    await asUser(ids.other);
+    await db.query(`insert into pay_adjustments (workspace_id, profile_id, date, amount, note)
+      values ('${ids.ws}', '${ids.profile}', '2026-08-24', 50, 'Bonus'), ('${ids.ws}', '${ids.admin}', '2026-08-24', -10, 'Trattenuta')`);
+    await asUser();
+    const { rows } = await db.query('select profile_id from pay_adjustments');
+    assert.deepEqual(rows.map(r => r.profile_id), [ids.profile]);
   });
 
   await scenario('solo un admin annulla una lezione in una data', async () => {

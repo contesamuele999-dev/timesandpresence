@@ -842,6 +842,7 @@
     members: { name: "Membri", description: "Modifiche ai membri e ai loro ruoli" },
     absence: { name: "Richieste di assenza", description: "Richieste di assenza e loro conferma" }
   };
+  var REMINDER_ID = 2147483647;
   var PresencerPrint = registerPlugin("PresencerPrint");
   function channelId(category) {
     return `presencer_${CHANNELS[category] ? category : "schedule"}`;
@@ -954,6 +955,27 @@
         console.warn(err);
       }
       pushToken = null;
+    },
+    // Promemoria presenza: uno solo alla volta, sempre con lo stesso id (notify usa 1..2147483646).
+    async scheduleReminder({ at, body }) {
+      if (!Capacitor.isNativePlatform()) return;
+      await ensureChannels();
+      await LocalNotifications.cancel({ notifications: [{ id: REMINDER_ID }] });
+      await LocalNotifications.schedule({
+        notifications: [{
+          id: REMINDER_ID,
+          title: "Presenza da segnare",
+          body,
+          schedule: { at, allowWhileIdle: true },
+          channelId: channelId("attendance"),
+          smallIcon: "ic_stat_presencer",
+          largeIcon: "presencer_icon"
+        }]
+      });
+    },
+    async cancelReminder() {
+      if (!Capacitor.isNativePlatform()) return;
+      await LocalNotifications.cancel({ notifications: [{ id: REMINDER_ID }] });
     },
     async notify(event) {
       if (!Capacitor.isNativePlatform()) return;

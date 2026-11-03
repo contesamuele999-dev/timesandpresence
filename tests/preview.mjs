@@ -8,7 +8,7 @@ const db = {
   slots: [0, 2, 4].map(weekday => ({ id: `slot-${weekday}`, calendar_id: 'cal-test', weekday, start_time: '18:00', end_time: '19:00', label: 'Lezione di prova' })),
   attendance: [], recurring_presence: [], extra_slots: [], lesson_logs: [],
   calendar_periods: [], notification_preferences: [], app_events: [],
-  lesson_cancellations: [], absence_requests: [], pay_settings: [],
+  lesson_cancellations: [], absence_requests: [], pay_settings: [], pay_adjustments: [],
 };
 // Un mese di presenze finte, per vedere la scheda Ore con qualche numero.
 const monday = new Date(); monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);

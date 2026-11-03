@@ -224,6 +224,8 @@ declare
   event_category text;
   event_title text;
   event_body text;
+  sub_changed boolean := false;   -- risposta (o proposta) del sostituto, a stato invariato
+  sub_name text;
 begin
   if tg_op = 'DELETE' then row_data := old; else row_data := new; end if;
   if pg_trigger_depth() > 1 then
@@ -237,7 +239,12 @@ begin
     event_title := case tg_op when 'DELETE' then 'Lezione ripristinata' else 'Lezione annullata' end;
     event_body := coalesce(lesson, 'Lezione') || ' · ' || to_char(row_data.date, 'DD/MM/YYYY');
   else
-    if tg_op = 'UPDATE' and new.status is not distinct from old.status then return new; end if;
+    -- le colonne del sostituto arrivano con migration_sostituzioni_rettifiche.sql: lette via jsonb
+    if tg_op = 'UPDATE' and new.status is not distinct from old.status then
+      sub_changed := to_jsonb(new)->>'substitute_status' is distinct from to_jsonb(old)->>'substitute_status';
+      if not sub_changed then return new; end if;
+    end if;
+    select name into sub_name from profiles where id = (to_jsonb(row_data)->>'substitute_id')::uuid;
     ws_id := row_data.workspace_id;
     if row_data.slot_id is not null then
       select label || ' ' || to_char(start_time, 'HH24:MI') into lesson from slots where id = row_data.slot_id;
@@ -247,6 +254,9 @@ begin
     select name into target_name from profiles where id = row_data.instructor_id;
     event_category := 'absence';
     event_title := case
+      when sub_changed then case to_jsonb(row_data)->>'substitute_status'
+        when 'accettata' then 'Sostituzione accettata' when 'rifiutata' then 'Sostituzione rifiutata'
+        else 'Sostituzione proposta' end
       when tg_op = 'INSERT' then 'Richiesta di assenza'
       when tg_op = 'DELETE' then 'Richiesta di assenza ritirata'
       when row_data.status = 'approvata' then 'Assenza approvata'
@@ -254,7 +264,8 @@ begin
       else 'Richiesta di assenza riaperta' end;
     event_body := coalesce(target_name, 'Un membro') || ' · ' || coalesce(lesson, 'lezione') || ' · ' ||
       to_char(row_data.date, 'DD/MM/YYYY') ||
-      case when tg_op = 'INSERT' and coalesce(row_data.reason, '') <> '' then ' · ' || row_data.reason else '' end;
+      case when tg_op = 'INSERT' and coalesce(row_data.reason, '') <> '' then ' · ' || row_data.reason else '' end ||
+      case when sub_name is not null then ' · sostituto: ' || sub_name else '' end;
   end if;
 
   if ws_id is null then

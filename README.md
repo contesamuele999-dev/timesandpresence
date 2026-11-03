@@ -90,6 +90,9 @@ arriva quindi sul telefono al successivo avvio, senza reinstallare. Il service w
 per aprire l'app anche senza rete. Va reinstallato solo quando cambia la parte nativa (plugin
 Capacitor, `PrintPlugin`, icone, permessi) o `capacitor.config.json`.
 
+Se l'app resta aperta mentre pubblichi, al ritorno in primo piano compare **"Nuova versione disponibile"**:
+un tocco su *Aggiorna* la ricarica.
+
 Il progetto nativo usa l'ID `it.presencer.app`, include l'icona Presencer e supporta Android 7 (API 24) o successivo.
 
 ## 5. Deploy su GitHub Pages
@@ -153,6 +156,9 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
    e categorie di notifica separate.
 7. [`migration_ore_compensi.sql`](migration_ore_compensi.sql) — ore, compensi, assenze, lezioni annullate.
 8. [`migration_recurring_unpaid.sql`](migration_recurring_unpaid.sql) — presenza ricorrente non retribuita.
+9. [`migration_sostituzioni_rettifiche.sql`](migration_sostituzioni_rettifiche.sql) — sostituto nelle richieste di
+   assenza e rettifiche dei compensi (bonus, rimborsi, trattenute). Riesegui prima `migration_ore_compensi.sql`:
+   le notifiche ora raccontano anche le sostituzioni.
 
 ## Come funziona
 

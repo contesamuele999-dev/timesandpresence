@@ -1,4 +1,4 @@
-const CACHE = 'presencer-v7';
+const CACHE = 'presencer-v8';
 // La libreria Supabase sta su CDN: senza copia in cache, un avvio senza rete
 // (o con rete lenta) lascia l'app senza login e con la schermata vuota.
 const VENDOR = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
@@ -51,8 +51,10 @@ self.addEventListener('fetch', e => {
 
   // network-first: quando c'è connessione usa sempre la versione più recente
   // (offline, o rete lenta, torna alla copia in cache così l'app resta usabile)
+  // no-cache: chiede sempre al sito se il file è cambiato (risposta 304 se no),
+  // così "Aggiorna" carica davvero la versione nuova e non la copia HTTP di 10 minuti fa.
   e.respondWith(
-    fetch(e.request).then(res => {
+    fetch(e.request.url, {cache:'no-cache', credentials:'same-origin'}).then(res => {
       caches.open(CACHE).then(c => c.put(e.request, res.clone()));
       return res;
     }).catch(() => caches.match(e.request))

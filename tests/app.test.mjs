@@ -308,3 +308,40 @@ test('le letture lunghe vanno a pagine da 1000 righe', async () => {
   assert.equal(rows.length, 2003);
   assert.deepEqual(calls.map(c => c.range[0]), [0, 1000, 2000]);
 });
+
+test('rettifiche: entrano nel totale e nel foglio paghe, non nelle ore', () => {
+  const { app } = appWith();
+  const people = [{ id: 'a', name: 'Anna', grade: 'istruttore' }];
+  const slots = [{ id: 's', calendar_id: 'cal', weekday: 0, start_time: '09:00', end_time: '10:00', label: 'Adulti' }];
+  const data = { from: '2026-09-07', to: '2026-09-13', slots, extras: [], cancellations: [], recurring: [],
+    attendance: [{ slot_id: 's', instructor_id: 'a', date: '2026-09-07', status: 'presente' }],
+    adjustments: [{ id: 'x', profile_id: 'a', date: '2026-09-06', amount: 5, note: 'Fuori periodo' },
+      { id: 'y', profile_id: 'a', date: '2026-09-08', amount: '-2.5', note: 'Trattenuta' },
+      { id: 'z', profile_id: 'a', date: '2026-09-07', amount: 15, note: 'Rimborso' }] };
+  const [a] = app.computePayroll(data, { default_rate: 20, rates: {}, copresence_factor: 0.5, master_takes_all: true }, people, () => 'cal');
+  assert.equal(a.hours, 1);
+  assert.equal(a.lessons, 1);
+  assert.equal(a.adjust, 12.5);
+  assert.equal(a.amount, 32.5);
+  assert.equal(a.entries.map(e => e.label).join(), 'Adulti,Rettifica,Rettifica');
+  const csv = app.payrollCsv([a], data.from, data.to).split('\r\n');
+  assert.equal(csv.length, 2);
+  assert.equal(csv[1], '"Anna";"2026-09-07";"2026-09-13";"ore";"1";"1";"1";"20";"0";"12,5";"32,5"');
+});
+
+test('sostituzione: il collega proposto accetta e la richiesta si aggiorna', async () => {
+  const { app, S, calls, date } = appWith(request => ({ data: request.operation === 'update'
+    ? { id: 'req', instructor_id: 'other', substitute_id: 'profile', ...request.payload } : [] }));
+  vm.runInContext('toast = ()=>{}; closeModal = ()=>{}', app);
+  S.absenceRequests = [{ id: 'req', instructor_id: 'other', slot_id: 'slot', date, status: 'in_attesa', substitute_id: 'profile', substitute_status: 'proposta' }];
+  await app.answerSubstitute('req', true);
+  assert.equal(calls[0].table, 'absence_requests');
+  assert.deepEqual({ ...calls[0].payload }, { substitute_status: 'accettata' });
+  // accettata: il database ha segnato la presenza, la settimana si rilegge
+  assert.ok(calls.slice(1).some(c => c.operation === 'select'));
+  // la richiesta con sostituto parte già "proposta"
+  await app.requestAbsence(ref, date, '', 'other');
+  const insert = calls.find(c => c.operation === 'insert');
+  assert.equal(insert.payload.substitute_id, 'other');
+  assert.equal(insert.payload.substitute_status, 'proposta');
+});
