@@ -294,21 +294,30 @@ test('ricorrenza non retribuita: ore contate, compenso zero, la riga del giorno 
   assert.equal(rows.a.amount, 10); // con b non retribuito, a non è in compresenza
 });
 
-test('non retribuita ogni settimana: chiude la ricorrenza vecchia e ne apre una nuova', async () => {
+test('spunta ogni settimana: vale dalla lezione scelta, anche nel passato e sulle presenze segnate a mano', async () => {
   let n = 0;
-  const { app, S, calls, date } = appWith(request => ({ data: { id: 'r' + (++n), ...request.payload } }));
+  const { app, S, calls, date } = appWith(request => request.single
+    ? { data: request.operation === 'update'
+      ? { ...S.recurring.find(r => r.id === request.filters[0].value), ...request.payload }
+      : { id: 'r' + (++n), ...request.payload } }
+    : { data: request.table === 'attendance' ? [{ ...S.attendance[0], ...request.payload }] : [] });
   vm.runInContext('toast = ()=>{}', app);
+  // ricorrenza da gennaio; presenza segnata a mano il 14/9
   S.recurring = [{ id: 'old', slot_id: 'slot', instructor_id: 'profile', status: 'presente', created_at: '2026-01-05T10:00:00Z', ended_on: null }];
-  await app.setRecurringPayFlag('slot', 'unpaid', true);
-  assert.deepEqual(calls.map(c => c.operation), ['update', 'insert']);
-  assert.equal(calls[0].payload.ended_on, date);
-  assert.equal(calls[1].payload.unpaid, true);
-  assert.equal(app.myPayFlagOn(ref, date, 'unpaid'), true);
-  // nata questa settimana: si aggiorna e basta
-  await app.setRecurringPayFlag('slot', 'unpaid', false);
-  assert.equal(calls[2].operation, 'update');
-  assert.equal(calls.length, 3);
-  assert.equal(app.myPayFlagOn(ref, date, 'unpaid'), false);
+  S.attendance = [{ id: 'a1', slot_id: 'slot', instructor_id: 'profile', date: '2026-09-14', status: 'presente', unpaid: false, full_pay: false }];
+  await app.setRecurringPayFlag('slot', 'full_pay', true, '2026-09-16');
+  assert.deepEqual(calls.map(c => c.operation), ['update', 'insert', 'update']);
+  assert.equal(calls[0].payload.ended_on, '2026-09-14');   // spezzata al lunedì della lezione
+  assert.equal(calls[1].payload.full_pay, true);
+  assert.deepEqual(calls[2].filters.map(f => f.value), ['slot', 'profile', 'presente', '2026-09-14']);
+  assert.equal(app.myPayFlagOn(ref, '2026-09-07', 'full_pay'), false);
+  assert.equal(app.myPayFlagOn(ref, '2026-09-21', 'full_pay'), true);
+  assert.equal(app.myPayFlagOn(ref, date, 'full_pay'), true);
+  assert.equal(S.attendance[0].full_pay, true);
+  // la ricorrenza nata dal 14/9 si aggiorna e basta
+  await app.setRecurringPayFlag('slot', 'full_pay', false, '2026-09-14');
+  assert.deepEqual(calls.slice(3).map(c => c.operation), ['update', 'update']);
+  assert.equal(app.myPayFlagOn(ref, date, 'full_pay'), false);
 });
 
 test('le letture lunghe vanno a pagine da 1000 righe', async () => {

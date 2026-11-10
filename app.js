@@ -1684,9 +1684,9 @@ function recurringStatusOn(slotId, instructorId, dateStr, recurring=S.recurring)
 const PAY_FLAG_LABEL = {unpaid:'non retribuita', full_pay:'compenso pieno'};
 const PAY_FLAG_TOAST = {   // [giorno, ogni settimana] × [spenta, accesa]
   unpaid:[['Presenza di nuovo retribuita.', 'Presenza segnata come non retribuita.'],
-    ['Di nuovo retribuita ogni settimana, da questa settimana.', 'Non retribuita ogni settimana, da questa settimana.']],
+    ['Di nuovo retribuita ogni settimana, da questa lezione in poi.', 'Non retribuita ogni settimana, da questa lezione in poi.']],
   full_pay:[['Compenso di nuovo diviso in compresenza.', 'Compenso pieno su questa lezione.'],
-    ['Compenso di nuovo diviso in compresenza, da questa settimana.', 'Compenso pieno ogni settimana, da questa settimana.']],
+    ['Compenso di nuovo diviso in compresenza, da questa lezione in poi.', 'Compenso pieno ogni settimana, da questa lezione in poi.']],
 };
 function payFlagPatch(field, on){ return {unpaid: on && field==='unpaid', full_pay: on && field==='full_pay'}; }
 // spunta di compenso in quella data: la riga del giorno vince sulla ricorrenza
@@ -1847,27 +1847,41 @@ async function toggleRecurring(ref, slotId, dateStr){
   });
 }
 
-// Spunta di compenso ogni settimana. Senza ricorrenza la crea (presente); su una ricorrenza
-// nata prima di questa settimana la chiude e ne apre una nuova, così le settimane
-// passate restano pagate com'erano.
-async function setRecurringPayFlag(slotId, field, on){
+// Spunta di compenso ogni settimana, dalla settimana della lezione scelta (fromDate) in poi.
+// Le ricorrenze iniziate da lì si aggiornano; quella a cavallo si spezza, così le settimane
+// prima restano com'erano. Vale anche sulle presenze segnate a mano da lì in poi.
+// Senza ricorrenza attiva ne crea una (presente) da questa settimana: niente presenze nel passato.
+async function setRecurringPayFlag(slotId, field, on, fromDate){
   if(isGuest()) return;
   return runPresenceWrite(PAY_FLAG_LABEL[field]+' ricorrente', async ()=>{
-    const existing = activeRecurring(slotId, myProfileId());
-    const thisMonday = toISO(mondayOf(0));
+    const me = myProfileId(), thisMonday = toISO(mondayOf(0));
+    const from = fromDate ? mondayISOOf(fromDate+'T12:00:00') : thisMonday;
+    const startAt = iso=>{ const [y,m,d] = iso.split('-').map(Number); return new Date(y, m-1, d, 12).toISOString(); };
     const patch = payFlagPatch(field, on);
-    const done = PAY_FLAG_TOAST[field][1][on ? 1 : 0];
-    let closed = null;
-    if(existing && mondayISOOf(existing.created_at) >= thisMonday){
-      const data = await checkedRow(sb.from('recurring_presence').update(patch).eq('id', existing.id).select());
-      return ()=>{ S.recurring = S.recurring.map(r=>r.id===existing.id ? data : r); toast(done); };
+    const mine = S.recurring.filter(r=> r.slot_id===slotId && r.instructor_id===me && (!r.ended_on || r.ended_on > from));
+    const changed = [], added = [];
+    for(const r of mine){
+      if(mondayISOOf(r.created_at) >= from){
+        changed.push(await checkedRow(sb.from('recurring_presence').update(patch).eq('id', r.id).select()));
+        continue;
+      }
+      // a cavallo: si chiude prima della settimana scelta e riparte da lì con la spunta
+      changed.push(await checkedRow(sb.from('recurring_presence').update({ended_on:from}).eq('id', r.id).select()));
+      added.push(await checkedRow(sb.from('recurring_presence').insert(Object.assign({slot_id:slotId, instructor_id:me,
+        status:r.status||'presente', created_at:startAt(from), ended_on:r.ended_on||null}, patch)).select()));
     }
-    if(existing) closed = await checkedRow(sb.from('recurring_presence').update({ended_on:thisMonday}).eq('id', existing.id).select());
-    const data = await checkedRow(sb.from('recurring_presence')
-      .insert(Object.assign({slot_id:slotId, instructor_id:myProfileId(), status:existing ? existing.status : 'presente'}, patch)).select());
+    if(on && !mine.some(r=> !r.ended_on)){
+      const row = Object.assign({slot_id:slotId, instructor_id:me, status:'presente'}, patch);
+      if(from > thisMonday) row.created_at = startAt(from);
+      added.push(await checkedRow(sb.from('recurring_presence').insert(row).select()));
+    }
+    const marked = await checkedRows(sb.from('attendance').update(patch)
+      .eq('slot_id', slotId).eq('instructor_id', me).eq('status', 'presente').gte('date', from).select());
     return ()=>{
-      S.recurring = S.recurring.map(r=>closed && r.id===existing.id ? closed : r).concat(data);
-      toast(done);
+      const byId = new Map(changed.concat(marked).map(x=>[x.id, x]));
+      S.recurring = S.recurring.map(r=> byId.get(r.id) || r).concat(added);
+      S.attendance = S.attendance.map(a=> byId.get(a.id) || a);
+      toast(PAY_FLAG_TOAST[field][1][on ? 1 : 0]);
     };
   });
 }
@@ -4199,13 +4213,14 @@ function renderModal(){
       ['full_pay', 'Compenso pieno', 'Prendi la tariffa intera anche se alla lezione ci sono altri istruttori o il maestro.'],
     ].map(([field, title, hint])=>{
       const dayOn = canUnpaid && myPayFlagOn(m.ref, m.date, field);
-      const recOn = !!(myRec && myRec[field]);
+      const recAt = recurringOn(m.slotId, myProfileId(), m.date) || myRec;
+      const recOn = !!(recAt && recAt[field]);
       return `<label class="checkrow"><input type="checkbox" data-pay="${field}" ${dayOn?'checked':''} ${canUnpaid && !disabled?'':'disabled'}>
         <span><b>${title}</b><small>${canUnpaid ? hint : 'Segna prima la presenza a questa lezione.'}</small></span></label>
       ${!m.extra ? `<label class="checkrow"><input type="checkbox" data-pay-rec="${field}" ${recOn?'checked':''} ${canRecUnpaid && !disabled?'':'disabled'}>
         <span><b>${title} ogni settimana 🔁</b><small>${!canRecUnpaid ? 'La tua ricorrenza su questo orario è "assente".'
-          : myRec ? 'Vale da questa settimana su tutte le prossime; le settimane passate restano come erano.'
-          : 'Attiva la presenza ricorrente su questo orario da questa settimana.'}</small></span></label>` : ''}`;
+          : myRec ? 'Vale da questa lezione su tutte le prossime; le settimane prima restano come erano.'
+          : 'Attiva la presenza ricorrente da questa settimana; vale anche sulle presenze già segnate da questa lezione in poi.'}</small></span></label>` : ''}`;
     }).join('');
     const canAsk = !req || req.status==='rifiutata';
     const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
@@ -4239,7 +4254,7 @@ function renderModal(){
         </div>
         <button class="btn danger block" id="cl_go">Annulla lezione</button>` : ''}`;
     box.querySelectorAll('[data-pay]').forEach(el=> el.onchange = ()=> setAttendancePayFlag(m.ref, m.date, el.dataset.pay, el.checked));
-    box.querySelectorAll('[data-pay-rec]').forEach(el=> el.onchange = ()=> setRecurringPayFlag(m.slotId, el.dataset.payRec, el.checked));
+    box.querySelectorAll('[data-pay-rec]').forEach(el=> el.onchange = ()=> setRecurringPayFlag(m.slotId, el.dataset.payRec, el.checked, m.date));
     const send = box.querySelector('#ab_send');
     if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim(), box.querySelector('#ab_sub')?.value || null);
     const withdraw = box.querySelector('#ab_withdraw');
