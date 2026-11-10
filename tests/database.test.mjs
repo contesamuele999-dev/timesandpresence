@@ -56,6 +56,8 @@ test('schema, notifiche e permessi delle presenze su PostgreSQL', async t => {
   await db.exec(await sqlFile('migration_recurring_unpaid.sql'));
   await db.exec(await sqlFile('migration_sostituzioni_rettifiche.sql'));
   await db.exec(await sqlFile('migration_sostituzioni_rettifiche.sql'));
+  await db.exec(await sqlFile('migration_full_pay.sql'));
+  await db.exec(await sqlFile('migration_full_pay.sql'));
 
   async function scenario(name, fn) {
     await t.test(name, async () => {

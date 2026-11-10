@@ -236,6 +236,15 @@ test('compensi: tariffa piena, compresenza a 2/3, maestro prende tutto, annullat
   assert.equal(volunteer.b.amount, 0);
   assert.equal(volunteer.b.hours, 1.5);
   assert.equal(volunteer.b.entries[0].note, 'non retribuita');
+  // compenso pieno: tariffa intera anche in compresenza, l'altro resta in compresenza
+  const fullPay = run(data([{ ...present('a', '2026-09-07'), full_pay: true }, present('b', '2026-09-07')]));
+  assert.equal(fullPay.a.amount, 30);
+  assert.equal(fullPay.a.entries[0].note, 'compenso pieno');
+  assert.equal(fullPay.b.amount, 20);
+  // ...e anche con il maestro presente, che resta a tariffa piena
+  const fullWithMaster = run(data([{ ...present('a', '2026-09-07'), full_pay: true }, present('m', '2026-09-07')]));
+  assert.equal(fullWithMaster.a.amount, 30);
+  assert.equal(fullWithMaster.m.amount, 30);
   // un maestro non retribuito non toglie il compenso agli istruttori
   const freeMaster = run(data([present('a', '2026-09-07'), { ...present('m', '2026-09-07'), unpaid: true }]));
   assert.equal(freeMaster.a.amount, 30);
@@ -290,16 +299,16 @@ test('non retribuita ogni settimana: chiude la ricorrenza vecchia e ne apre una 
   const { app, S, calls, date } = appWith(request => ({ data: { id: 'r' + (++n), ...request.payload } }));
   vm.runInContext('toast = ()=>{}', app);
   S.recurring = [{ id: 'old', slot_id: 'slot', instructor_id: 'profile', status: 'presente', created_at: '2026-01-05T10:00:00Z', ended_on: null }];
-  await app.setRecurringUnpaid('slot', true);
+  await app.setRecurringPayFlag('slot', 'unpaid', true);
   assert.deepEqual(calls.map(c => c.operation), ['update', 'insert']);
   assert.equal(calls[0].payload.ended_on, date);
   assert.equal(calls[1].payload.unpaid, true);
-  assert.equal(app.myUnpaidOn(ref, date), true);
+  assert.equal(app.myPayFlagOn(ref, date, 'unpaid'), true);
   // nata questa settimana: si aggiorna e basta
-  await app.setRecurringUnpaid('slot', false);
+  await app.setRecurringPayFlag('slot', 'unpaid', false);
   assert.equal(calls[2].operation, 'update');
   assert.equal(calls.length, 3);
-  assert.equal(app.myUnpaidOn(ref, date), false);
+  assert.equal(app.myPayFlagOn(ref, date, 'unpaid'), false);
 });
 
 test('le letture lunghe vanno a pagine da 1000 righe', async () => {

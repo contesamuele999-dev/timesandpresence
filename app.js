@@ -1679,12 +1679,22 @@ function recurringStatusOn(slotId, instructorId, dateStr, recurring=S.recurring)
   const r = recurringOn(slotId, instructorId, dateStr, recurring);
   return r ? (r.status || 'presente') : null;
 }
-// "non retribuita" in quella data: la riga del giorno vince sulla ricorrenza
-function myUnpaidOn(ref, dateStr){
+// Spunte di compenso su una presenza, alternative tra loro:
+// unpaid = ore contate ma niente compenso; full_pay = tariffa piena anche in compresenza.
+const PAY_FLAG_LABEL = {unpaid:'non retribuita', full_pay:'compenso pieno'};
+const PAY_FLAG_TOAST = {   // [giorno, ogni settimana] × [spenta, accesa]
+  unpaid:[['Presenza di nuovo retribuita.', 'Presenza segnata come non retribuita.'],
+    ['Di nuovo retribuita ogni settimana, da questa settimana.', 'Non retribuita ogni settimana, da questa settimana.']],
+  full_pay:[['Compenso di nuovo diviso in compresenza.', 'Compenso pieno su questa lezione.'],
+    ['Compenso di nuovo diviso in compresenza, da questa settimana.', 'Compenso pieno ogni settimana, da questa settimana.']],
+};
+function payFlagPatch(field, on){ return {unpaid: on && field==='unpaid', full_pay: on && field==='full_pay'}; }
+// spunta di compenso in quella data: la riga del giorno vince sulla ricorrenza
+function myPayFlagOn(ref, dateStr, field){
   const row = findMyAttendance(ref, dateStr);
-  if(row) return row.status==='presente' && !!row.unpaid;
+  if(row) return row.status==='presente' && !!row[field];
   const r = ref.slot_id && !isGuest() ? recurringOn(ref.slot_id, myProfileId(), dateStr) : null;
-  return !!(r && (r.status||'presente')==='presente' && r.unpaid);
+  return !!(r && (r.status||'presente')==='presente' && r[field]);
 }
 
 // stato "effettivo" per me su uno slot/data: riga esplicita se c'è, altrimenti presenza
@@ -1762,20 +1772,21 @@ async function setAttendanceStatus(ref, dateStr, status){
   });
 }
 
-// Presenza segnata ma esclusa dai compensi. Su una presenza ricorrente crea la riga
-// esplicita di quel giorno, che vale come eccezione solo per quella data.
-async function setAttendanceUnpaid(ref, dateStr, unpaid){
+// Spunta di compenso (non retribuita / compenso pieno) su una sola data. Su una presenza
+// ricorrente crea la riga esplicita di quel giorno, che vale come eccezione solo per quella data.
+async function setAttendancePayFlag(ref, dateStr, field, on){
   if(isGuest()) return;
   const state = myAttendanceState(ref, dateStr);
   if(state!=='presente' && state!=='ricorrente') return toast('Prima segna la presenza.');
-  return runPresenceWrite('Presenza non retribuita', async ()=>{
+  return runPresenceWrite('Presenza '+PAY_FLAG_LABEL[field], async ()=>{
     const existing = findMyAttendance(ref, dateStr);
+    const patch = payFlagPatch(field, on);
     const data = existing
-      ? await checkedRow(sb.from('attendance').update({unpaid}).eq('id', existing.id).select())
-      : await checkedRow(sb.from('attendance').insert(Object.assign({date:dateStr, status:'presente', unpaid, instructor_id:myProfileId()}, ref)).select());
+      ? await checkedRow(sb.from('attendance').update(patch).eq('id', existing.id).select())
+      : await checkedRow(sb.from('attendance').insert(Object.assign({date:dateStr, status:'presente', instructor_id:myProfileId()}, patch, ref)).select());
     return ()=>{
       S.attendance = existing ? S.attendance.map(a=>a.id===existing.id ? data : a) : S.attendance.concat(data);
-      toast(unpaid ? 'Presenza segnata come non retribuita.' : 'Presenza di nuovo retribuita.');
+      toast(PAY_FLAG_TOAST[field][0][on ? 1 : 0]);
     };
   });
 }
@@ -1826,39 +1837,39 @@ async function toggleRecurring(ref, slotId, dateStr){
     const cur = findMyAttendance(ref, dateStr);
     const status = cur ? cur.status : 'presente';
     const row = {slot_id:slotId, instructor_id:myProfileId(), status};
-    if(cur && cur.unpaid && status==='presente') row.unpaid = true;
+    const flag = cur && status==='presente' ? Object.keys(PAY_FLAG_LABEL).find(f=> cur[f]) : null;
+    if(flag) row[flag] = true;
     const data = await checkedRow(sb.from('recurring_presence').insert(row).select());
     return ()=>{
       S.recurring.push(data);
-      toast('Presenza ricorrente attivata: segnato "'+status+(row.unpaid ? ' non retribuita' : '')+'" ogni settimana su questo orario.');
+      toast('Presenza ricorrente attivata: segnato "'+status+(flag ? ', '+PAY_FLAG_LABEL[flag] : '')+'" ogni settimana su questo orario.');
     };
   });
 }
 
-// Non retribuita ogni settimana. Senza ricorrenza la crea (presente); su una ricorrenza
+// Spunta di compenso ogni settimana. Senza ricorrenza la crea (presente); su una ricorrenza
 // nata prima di questa settimana la chiude e ne apre una nuova, così le settimane
 // passate restano pagate com'erano.
-async function setRecurringUnpaid(slotId, unpaid){
+async function setRecurringPayFlag(slotId, field, on){
   if(isGuest()) return;
-  return runPresenceWrite('Non retribuita ricorrente', async ()=>{
+  return runPresenceWrite(PAY_FLAG_LABEL[field]+' ricorrente', async ()=>{
     const existing = activeRecurring(slotId, myProfileId());
     const thisMonday = toISO(mondayOf(0));
+    const patch = payFlagPatch(field, on);
+    const done = PAY_FLAG_TOAST[field][1][on ? 1 : 0];
     let closed = null;
     if(existing && mondayISOOf(existing.created_at) >= thisMonday){
-      const data = await checkedRow(sb.from('recurring_presence').update({unpaid}).eq('id', existing.id).select());
-      return ()=>{ S.recurring = S.recurring.map(r=>r.id===existing.id ? data : r); toast(unpaidToast(unpaid)); };
+      const data = await checkedRow(sb.from('recurring_presence').update(patch).eq('id', existing.id).select());
+      return ()=>{ S.recurring = S.recurring.map(r=>r.id===existing.id ? data : r); toast(done); };
     }
     if(existing) closed = await checkedRow(sb.from('recurring_presence').update({ended_on:thisMonday}).eq('id', existing.id).select());
     const data = await checkedRow(sb.from('recurring_presence')
-      .insert({slot_id:slotId, instructor_id:myProfileId(), status:existing ? existing.status : 'presente', unpaid}).select());
+      .insert(Object.assign({slot_id:slotId, instructor_id:myProfileId(), status:existing ? existing.status : 'presente'}, patch)).select());
     return ()=>{
       S.recurring = S.recurring.map(r=>closed && r.id===existing.id ? closed : r).concat(data);
-      toast(unpaidToast(unpaid));
+      toast(done);
     };
   });
-}
-function unpaidToast(unpaid){
-  return unpaid ? 'Non retribuita ogni settimana, da questa settimana.' : 'Di nuovo retribuita ogni settimana, da questa settimana.';
 }
 
 async function addExtraSlot({date, start_time, end_time, label}){
@@ -1933,12 +1944,17 @@ function computePayroll(data, pay, people, calendarFor){
       const marks = data.attendance.filter(a=> a.date===dateStr && sameLesson(a, ref));
       const present = [];
       const unpaid = new Set();   // presenti che hanno scelto di non farsi pagare questa lezione
+      const full = new Set();     // presenti con compenso pieno anche in compresenza
+      const flags = (p, src)=>{
+        if(src.unpaid || p.forfaitMode) unpaid.add(p);
+        else if(src.full_pay) full.add(p);
+      };
       marks.forEach(a=>{
         if(a.status!=='presente') return;
         const p = a.instructor_id ? person(a.instructor_id, 'Membro rimosso', 'istruttore')
           : person('g:'+a.guest_token, (a.guest_name||'Ospite')+' (ospite)', 'istruttore');
         present.push(p);
-        if(a.unpaid || p.forfaitMode) unpaid.add(p);
+        flags(p, a);
       });
       if(ref.slot_id){
         const seen = new Set(marks.map(a=>a.instructor_id).filter(Boolean));
@@ -1949,7 +1965,7 @@ function computePayroll(data, pay, people, calendarFor){
           seen.add(r.instructor_id);
           const p = byKey.get(r.instructor_id);
           present.push(p);
-          if(cover.unpaid || p.forfaitMode) unpaid.add(p);
+          flags(p, cover);
         });
       }
       if(!present.length) return;
@@ -1963,13 +1979,14 @@ function computePayroll(data, pay, people, calendarFor){
       const share = paid.length>1 ? Number(pay.copresence_factor) : 1;
       const note = masters.length && candidates.length>masters.length ? 'con maestro caposcuola'
         : paid.length>1 ? `compresenza (${paid.length})` : '';
+      // compenso pieno: tariffa intera anche in compresenza o con il maestro; gli altri dividono come sempre
       present.forEach(p=>{
-        const isPaid = paid.includes(p);
-        const amount = isPaid ? round2(rate*hours*share) : 0;
+        const isPaid = full.has(p) || paid.includes(p);
+        const amount = isPaid ? round2(rate*hours*(full.has(p) ? 1 : share)) : 0;
         p.hours += hours; p.lessons++; p.amount = round2(p.amount+amount);
         if(isPaid) p.paidHours += hours;
         p.entries.push({date:dateStr, label:row.label, start:row.start_time, end:row.end_time, hours, rate, amount,
-          note: p.forfaitMode ? 'a forfait' : unpaid.has(p) ? 'non retribuita' : note});
+          note: p.forfaitMode ? 'a forfait' : unpaid.has(p) ? 'non retribuita' : full.has(p) ? 'compenso pieno' : note});
       });
     });
   });
@@ -2667,6 +2684,7 @@ async function restoreBackup(backup){
       if(!unique(['a', a.slot_id||'', a.extra_slot_id||'', who, a.date].join('|'))){ skipped++; return; }
       const row = {id:a.id, slot_id:a.slot_id||null, extra_slot_id:a.extra_slot_id||null, date:a.date, status:a.status, note:a.note||null};
       if(a.unpaid) row.unpaid = true;
+      if(a.full_pay) row.full_pay = true;
       if(a.guest_token){ row.guest_token = who; row.guest_name = a.guest_name||null; }
       else row.instructor_id = who;
       attendance.push(row);
@@ -2682,6 +2700,7 @@ async function restoreBackup(backup){
       const row = {id:r.id, slot_id:r.slot_id, instructor_id:who, status:r.status, created_at:r.created_at};
       if(r.ended_on) row.ended_on = r.ended_on;
       if(r.unpaid) row.unpaid = true;
+      if(r.full_pay) row.full_pay = true;
       recurring.push(row);
     });
     await insertAll('recurring_presence', recurring);
@@ -3402,13 +3421,13 @@ function renderDayList(dt){
     const logCount = canLog ? logsFor(it.ref, dateStr).length : 0;
     const iHaveLog = canLog && !!myLessonLog(it.ref, dateStr);
     const absence = myAbsenceRequest(it.ref, dateStr);
-    const unpaidText = myUnpaidOn(it.ref, dateStr) ? ' · non retribuita' : '';
+    const unpaidText = Object.keys(PAY_FLAG_LABEL).filter(f=> myPayFlagOn(it.ref, dateStr, f)).map(f=> ' · '+PAY_FLAG_LABEL[f]).join('');
     const absenceText = unpaidText + (!absence ? '' : absence.status==='in_attesa' ? ' · ⏳ assenza richiesta' : absence.status==='approvata' ? ' · assenza approvata' : ' · assenza rifiutata');
     const row = document.createElement('div');
     row.className = 'slot' + (it.extra ? ' extra' : '');
     row.innerHTML = `
       <div class="time">${fmtHM(it.start)}<br>${fmtHM(it.end)}</div>
-      <div class="info">${!isGuest() ? `<button class="lbl morebtn" title="Altre azioni: presenza non retribuita, richiesta di assenza${isAdmin()?', annulla lezione':''}">${esc(it.label)}</button>` : `<div class="lbl">${esc(it.label)}</div>`}<div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
+      <div class="info">${!isGuest() ? `<button class="lbl morebtn" title="Altre azioni: compenso (non retribuita o pieno), richiesta di assenza${isAdmin()?', annulla lezione':''}">${esc(it.label)}</button>` : `<div class="lbl">${esc(it.label)}</div>`}<div class="sub">${it.extra?'Lezione extra':'Ricorrente'}${absenceText}</div></div>
       ${canLog ? `<button class="btn ghost sm logbtn ${iHaveLog?'on':''}" title="Registro lezione: cosa hai fatto">📝${logCount?`<span class="logbadge">${logCount}</span>`:''}</button>` : ''}
       ${canRecur ? `<button class="btn ghost sm recurbtn ${recurOn?'on':''}" title="Ripeti lo stato ogni settimana su questo orario" ${presenceControlsDisabled() ? 'disabled' : ''}>🔁</button>` : ''}
       <button class="togglebtn ${btnClass}" ${presenceControlsDisabled() ? 'disabled' : ''}>${btnLabel}</button>
@@ -4172,10 +4191,22 @@ function renderModal(){
     const req = myAbsenceRequest(m.ref, m.date);
     const myState = myAttendanceState(m.ref, m.date);
     const canUnpaid = myState==='presente' || myState==='ricorrente';
-    const unpaidOn = canUnpaid && myUnpaidOn(m.ref, m.date);
     const myRec = !m.extra ? activeRecurring(m.slotId, myProfileId()) : null;
-    const recUnpaidOn = !!(myRec && myRec.unpaid);
     const canRecUnpaid = !m.extra && (!myRec || (myRec.status||'presente')==='presente');
+    const disabled = presenceControlsDisabled();
+    const payRows = [
+      ['unpaid', 'Presenza non retribuita', 'Risulti presente e le ore si contano, ma questa lezione non entra nei compensi.'],
+      ['full_pay', 'Compenso pieno', 'Prendi la tariffa intera anche se alla lezione ci sono altri istruttori o il maestro.'],
+    ].map(([field, title, hint])=>{
+      const dayOn = canUnpaid && myPayFlagOn(m.ref, m.date, field);
+      const recOn = !!(myRec && myRec[field]);
+      return `<label class="checkrow"><input type="checkbox" data-pay="${field}" ${dayOn?'checked':''} ${canUnpaid && !disabled?'':'disabled'}>
+        <span><b>${title}</b><small>${canUnpaid ? hint : 'Segna prima la presenza a questa lezione.'}</small></span></label>
+      ${!m.extra ? `<label class="checkrow"><input type="checkbox" data-pay-rec="${field}" ${recOn?'checked':''} ${canRecUnpaid && !disabled?'':'disabled'}>
+        <span><b>${title} ogni settimana 🔁</b><small>${!canRecUnpaid ? 'La tua ricorrenza su questo orario è "assente".'
+          : myRec ? 'Vale da questa settimana su tutte le prossime; le settimane passate restano come erano.'
+          : 'Attiva la presenza ricorrente su questo orario da questa settimana.'}</small></span></label>` : ''}`;
+    }).join('');
     const canAsk = !req || req.status==='rifiutata';
     const slot = !m.extra ? S.slots.find(x=>x.id===m.slotId) : null;
     const colleagues = S.instructors.filter(p=> p.id!==myProfileId());
@@ -4183,12 +4214,7 @@ function renderModal(){
       <div class="mhead"><h2>${esc(m.label)}</h2><button id="x">✕</button></div>
       <p class="hint" style="margin:0 0 14px">${esc(fmtHM(m.start))}–${esc(fmtHM(m.end))} · ${dateLabel}</p>
       <h3>Compenso</h3>
-      <label class="checkrow"><input type="checkbox" id="up_toggle" ${unpaidOn?'checked':''} ${canUnpaid && !presenceControlsDisabled()?'':'disabled'}>
-        <span><b>Presenza non retribuita</b><small>${canUnpaid ? 'Risulti presente e le ore si contano, ma questa lezione non entra nei compensi.' : 'Segna prima la presenza a questa lezione.'}</small></span></label>
-      ${!m.extra ? `<label class="checkrow"><input type="checkbox" id="up_rec_toggle" ${recUnpaidOn?'checked':''} ${canRecUnpaid && !presenceControlsDisabled()?'':'disabled'}>
-        <span><b>Non retribuita ogni settimana 🔁</b><small>${!canRecUnpaid ? 'La tua ricorrenza su questo orario è "assente".'
-          : myRec ? 'Vale da questa settimana su tutte le prossime; le settimane passate restano come erano.'
-          : 'Attiva la presenza ricorrente su questo orario, non retribuita, da questa settimana.'}</small></span></label>` : ''}
+      ${payRows}
       <h3 style="margin-top:18px">Richiesta di assenza</h3>
       ${canAsk ? `
         ${req ? '<p class="hint" style="margin:0 0 8px">La richiesta precedente è stata rifiutata.</p>' : ''}
@@ -4212,9 +4238,8 @@ function renderModal(){
           </div>
         </div>
         <button class="btn danger block" id="cl_go">Annulla lezione</button>` : ''}`;
-    box.querySelector('#up_toggle').onchange = e=> setAttendanceUnpaid(m.ref, m.date, e.target.checked);
-    const recToggle = box.querySelector('#up_rec_toggle');
-    if(recToggle) recToggle.onchange = e=> setRecurringUnpaid(m.slotId, e.target.checked);
+    box.querySelectorAll('[data-pay]').forEach(el=> el.onchange = ()=> setAttendancePayFlag(m.ref, m.date, el.dataset.pay, el.checked));
+    box.querySelectorAll('[data-pay-rec]').forEach(el=> el.onchange = ()=> setRecurringPayFlag(m.slotId, el.dataset.payRec, el.checked));
     const send = box.querySelector('#ab_send');
     if(send) send.onclick = ()=> requestAbsence(m.ref, m.date, box.querySelector('#ab_reason').value.trim(), box.querySelector('#ab_sub')?.value || null);
     const withdraw = box.querySelector('#ab_withdraw');

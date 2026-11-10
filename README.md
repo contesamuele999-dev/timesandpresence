@@ -159,6 +159,8 @@ Esegui in ordine, una tantum, nell'SQL Editor di Supabase:
 9. [`migration_sostituzioni_rettifiche.sql`](migration_sostituzioni_rettifiche.sql) — sostituto nelle richieste di
    assenza e rettifiche dei compensi (bonus, rimborsi, trattenute). Riesegui prima `migration_ore_compensi.sql`:
    le notifiche ora raccontano anche le sostituzioni.
+10. [`migration_full_pay.sql`](migration_full_pay.sql) — compenso pieno su una presenza (di un giorno o ogni
+   settimana) anche in compresenza.
 
 ## Come funziona
 
